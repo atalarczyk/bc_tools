@@ -2,6 +2,7 @@
   "backup_script": "/usr/local/bin/pg_backup.sh",
   "backup_root": "/var/local/backup/postgresql/dumps/",
   "default_retention": "14d",
+  "default_pg_dump_version": "13.23",
 
   "default_host": "db.example.com",
   "default_port": 5432,
@@ -29,6 +30,7 @@
       "database": "erpdb",
       "backup_dir": "/srv/backups",
       "retention_time": "30d",
+      "pg_dump_version": "14.18",
       "options": ["--dry-run"]
     }
   ]

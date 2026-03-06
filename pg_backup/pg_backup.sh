@@ -30,6 +30,8 @@
 
 set -Eeuo pipefail
 
+SCRIPT_VERSION="1.1.0"
+
 #------------------------------------------------------------------------------
 # Helper: print usage
 #------------------------------------------------------------------------------
@@ -48,6 +50,11 @@ Required options:
 
 Optional:
   --database-port     <port>        PostgreSQL port (default: 5432)
+  --pg-dump-version   <version>     Use specific pg_dump version (e.g. 13.23)
+  -pv [version]                     Show available pg_dump versions and default;
+                                    if version is provided, use version from
+                                    "pg_dump --version" output (e.g. 13.23)
+  -v, --version                     Show script version and exit
   --dry-run                         Do not connect to PostgreSQL, create dummy file
   -h, --help                        Show this help and exit
 
@@ -63,6 +70,12 @@ Examples:
   pg_backup.sh --dry-run --database-server localhost \
                --database-user test --database-password x \
                --database-name mydb --backup-dir /tmp/backups --retention-time 2d
+
+  pg_backup.sh -pv
+
+  pg_backup.sh -pv 13.23 --database-server db.example.com \
+               --database-user backupuser --database-password 'S3cret!' \
+               --database-name mydb --backup-dir /mnt/dane/Backup --retention-time 14d
 EOF
 }
 
@@ -78,6 +91,8 @@ log() {
 # Parse named parameters
 #------------------------------------------------------------------------------
 DRY_RUN=0
+PRINT_PG_DUMP_VERSIONS=0
+PG_DUMP_VERSION_REQUEST=""
 DB_HOST="" DB_PORT=5432 DB_USER="" DB_PASS="" DB_NAME="" BACKUP_ROOT="" RETENTION_RAW=""
 
 while [[ $# -gt 0 ]]; do
@@ -89,6 +104,17 @@ while [[ $# -gt 0 ]]; do
     --database-name)     DB_NAME="$2"; shift 2 ;;
     --backup-dir)        BACKUP_ROOT="$2"; shift 2 ;;
     --retention-time)    RETENTION_RAW="$2"; shift 2 ;;
+    --pg-dump-version)   PG_DUMP_VERSION_REQUEST="$2"; shift 2 ;;
+    -pv)
+      if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+        PG_DUMP_VERSION_REQUEST="$2"
+        shift 2
+      else
+        PRINT_PG_DUMP_VERSIONS=1
+        shift
+      fi
+      ;;
+    -v|--version)       echo "$SCRIPT_VERSION"; exit 0 ;;
     --dry-run)           DRY_RUN=1; shift ;;
     -h|--help)           usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 64 ;;
@@ -98,19 +124,21 @@ done
 #------------------------------------------------------------------------------
 # Validate parameters
 #------------------------------------------------------------------------------
-missing=()
-[[ -z "$DB_HOST" ]]        && missing+=("--database-server")
-[[ -z "$DB_USER" ]]        && missing+=("--database-user")
-[[ -z "$DB_PASS" ]]        && missing+=("--database-password")
-[[ -z "$DB_NAME" ]]        && missing+=("--database-name")
-[[ -z "$BACKUP_ROOT" ]]    && missing+=("--backup-dir")
-[[ -z "$RETENTION_RAW" ]]  && missing+=("--retention-time")
+if [[ "$PRINT_PG_DUMP_VERSIONS" -eq 0 ]]; then
+  missing=()
+  [[ -z "$DB_HOST" ]]        && missing+=("--database-server")
+  [[ -z "$DB_USER" ]]        && missing+=("--database-user")
+  [[ -z "$DB_PASS" ]]        && missing+=("--database-password")
+  [[ -z "$DB_NAME" ]]        && missing+=("--database-name")
+  [[ -z "$BACKUP_ROOT" ]]    && missing+=("--backup-dir")
+  [[ -z "$RETENTION_RAW" ]]  && missing+=("--retention-time")
 
-if (( ${#missing[@]} )); then
-  echo "ERROR: Missing required options: ${missing[*]}" >&2
-  echo
-  usage
-  exit 64
+  if (( ${#missing[@]} )); then
+    echo "ERROR: Missing required options: ${missing[*]}" >&2
+    echo
+    usage
+    exit 64
+  fi
 fi
 
 #------------------------------------------------------------------------------
@@ -140,6 +168,113 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing required command: $1" >&2; exit 127; }
 }
 
+get_pg_dump_version() {
+  local bin="$1" out=""
+  out="$("$bin" --version 2>/dev/null || true)"
+  if [[ "$out" =~ ([0-9]+([.][0-9]+)*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "unknown"
+  fi
+}
+
+declare -a PG_DUMP_BINARIES=()
+declare -a PG_DUMP_VERSIONS=()
+declare -A PG_DUMP_SEEN=()
+DEFAULT_PG_DUMP_BIN=""
+DEFAULT_PG_DUMP_VERSION=""
+SELECTED_PG_DUMP_BIN=""
+SELECTED_PG_DUMP_VERSION=""
+
+add_pg_dump_candidate() {
+  local candidate="$1" version=""
+  [[ -n "$candidate" && -x "$candidate" ]] || return 0
+  [[ -z "${PG_DUMP_SEEN[$candidate]:-}" ]] || return 0
+
+  PG_DUMP_SEEN["$candidate"]=1
+  version="$(get_pg_dump_version "$candidate")"
+  PG_DUMP_BINARIES+=("$candidate")
+  PG_DUMP_VERSIONS+=("$version")
+}
+
+discover_pg_dump_binaries() {
+  local candidate="" base="" dir=""
+  local nullglob_was_set=0
+  local -a path_dirs=()
+
+  PG_DUMP_BINARIES=()
+  PG_DUMP_VERSIONS=()
+  PG_DUMP_SEEN=()
+
+  DEFAULT_PG_DUMP_BIN="$(command -v pg_dump 2>/dev/null || true)"
+  if [[ -n "$DEFAULT_PG_DUMP_BIN" ]]; then
+    DEFAULT_PG_DUMP_VERSION="$(get_pg_dump_version "$DEFAULT_PG_DUMP_BIN")"
+    add_pg_dump_candidate "$DEFAULT_PG_DUMP_BIN"
+  else
+    DEFAULT_PG_DUMP_VERSION=""
+  fi
+
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+
+  IFS=':' read -r -a path_dirs <<< "${PATH:-}"
+  for dir in "${path_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for candidate in "$dir"/pg_dump*; do
+      [[ -x "$candidate" ]] || continue
+      base="${candidate##*/}"
+      [[ "$base" =~ ^pg_dump([._-]?[0-9]+([.][0-9]+)*)?$ ]] || continue
+      add_pg_dump_candidate "$candidate"
+    done
+  done
+
+  for candidate in /usr/lib/postgresql/*/bin/pg_dump /usr/pgsql-*/bin/pg_dump; do
+    [[ -x "$candidate" ]] || continue
+    add_pg_dump_candidate "$candidate"
+  done
+
+  if [[ "$nullglob_was_set" -eq 0 ]]; then
+    shopt -u nullglob
+  fi
+}
+
+print_pg_dump_versions() {
+  local i="" marker=""
+  if [[ -n "$DEFAULT_PG_DUMP_BIN" ]]; then
+    log "Default pg_dump: v${DEFAULT_PG_DUMP_VERSION} (${DEFAULT_PG_DUMP_BIN})"
+  else
+    log "Default pg_dump: not found in PATH"
+  fi
+
+  if (( ${#PG_DUMP_BINARIES[@]} == 0 )); then
+    log "No pg_dump binaries found in PATH/common PostgreSQL install directories."
+    return 1
+  fi
+
+  log "Available pg_dump binaries:"
+  for i in "${!PG_DUMP_BINARIES[@]}"; do
+    marker=""
+    [[ "${PG_DUMP_BINARIES[$i]}" == "$DEFAULT_PG_DUMP_BIN" ]] && marker=" [default]"
+    log "  - v${PG_DUMP_VERSIONS[$i]} | ${PG_DUMP_BINARIES[$i]}${marker}"
+  done
+}
+
+select_pg_dump_version() {
+  local requested="$1" i="" version=""
+  SELECTED_PG_DUMP_BIN=""
+  SELECTED_PG_DUMP_VERSION=""
+
+  for i in "${!PG_DUMP_BINARIES[@]}"; do
+    version="${PG_DUMP_VERSIONS[$i]}"
+    if [[ "$version" == "$requested" || "$version" == "$requested".* ]]; then
+      SELECTED_PG_DUMP_BIN="${PG_DUMP_BINARIES[$i]}"
+      SELECTED_PG_DUMP_VERSION="$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
 #------------------------------------------------------------------------------
 # Prerequisites
 #------------------------------------------------------------------------------
@@ -147,8 +282,28 @@ require_cmd find
 require_cmd date
 require_cmd flock
 require_cmd sha256sum
-if [[ "$DRY_RUN" -eq 0 ]]; then
-  require_cmd pg_dump
+discover_pg_dump_binaries
+
+if [[ "$PRINT_PG_DUMP_VERSIONS" -eq 1 ]]; then
+  print_pg_dump_versions || true
+  exit 0
+fi
+
+if [[ -n "$PG_DUMP_VERSION_REQUEST" ]]; then
+  if ! select_pg_dump_version "$PG_DUMP_VERSION_REQUEST"; then
+    log "ERROR: Requested pg_dump version '${PG_DUMP_VERSION_REQUEST}' is not available."
+    print_pg_dump_versions || true
+    exit 64
+  fi
+else
+  SELECTED_PG_DUMP_BIN="$DEFAULT_PG_DUMP_BIN"
+  SELECTED_PG_DUMP_VERSION="$DEFAULT_PG_DUMP_VERSION"
+fi
+
+if [[ "$DRY_RUN" -eq 0 && -z "$SELECTED_PG_DUMP_BIN" ]]; then
+  log "ERROR: pg_dump is required but no default pg_dump was found in PATH."
+  log "Use -pv to list available versions or pass -pv <version>."
+  exit 127
 fi
 
 umask 077
@@ -175,8 +330,13 @@ CHKSUM="${BACKUP_DIR}/${DB_NAME}-${TS}.dump.sha256"
 #------------------------------------------------------------------------------
 # Backup or simulate
 #------------------------------------------------------------------------------
+PG_DUMP_LOG_INFO="pg_dump=not-found"
+if [[ -n "$SELECTED_PG_DUMP_BIN" ]]; then
+  PG_DUMP_LOG_INFO="pg_dump=v${SELECTED_PG_DUMP_VERSION} (${SELECTED_PG_DUMP_BIN})"
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  log "[DRY-RUN] Simulating backup for '${DB_NAME}' on '${DB_HOST}:${DB_PORT}' ..."
+  log "[DRY-RUN] Simulating backup for '${DB_NAME}' on '${DB_HOST}:${DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
   cat > "$OUTFILE" <<EOF
 [DRY-RUN] PostgreSQL Backup Simulation
 Database:   $DB_NAME
@@ -186,9 +346,9 @@ User:       $DB_USER
 Timestamp:  $TS
 EOF
 else
-  log "Starting backup of '${DB_NAME}' from '${DB_HOST}:${DB_PORT}' ..."
+  log "Starting backup of '${DB_NAME}' from '${DB_HOST}:${DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
   export PGPASSWORD="$DB_PASS"
-  if ! pg_dump \
+  if ! "$SELECTED_PG_DUMP_BIN" \
     -h "$DB_HOST" \
     -p "$DB_PORT" \
     -U "$DB_USER" \

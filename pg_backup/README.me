@@ -10,6 +10,7 @@ This directory contains two Bash scripts for PostgreSQL backups:
 ### Purpose
 - Create a timestamped PostgreSQL dump (`pg_dump -Fc -Z 9`).
 - Optionally run in `--dry-run` mode (creates a dummy file, no DB connection).
+- Detect available `pg_dump` versions and default `pg_dump` in the system.
 - Create SHA256 checksum file.
 - Prune old dump/checksum files older than `--retention-time`.
 - Prevent concurrent runs for the same database using `flock`.
@@ -24,8 +25,14 @@ This directory contains two Bash scripts for PostgreSQL backups:
 
 ### Optional options
 - `--database-port <port>` (default: `5432`)
+- `-pv` (show available `pg_dump` versions and default version)
+- `-pv <version>` or `--pg-dump-version <version>` (use selected `pg_dump` version, for example `13.23`)
+- `-v`, `--version` (print script version and exit)
 - `--dry-run`
 - `-h`, `--help`
+
+`<version>` should match the numeric token from `pg_dump --version` output.
+Example: from `pg_dump (PostgreSQL) 13.23 (Ubuntu 13.23-1.pgdg22.04+1)` use `13.23`.
 
 ### Example
 ```bash
@@ -47,7 +54,7 @@ This directory contains two Bash scripts for PostgreSQL backups:
 
 ### Purpose
 - Read a JSON config file.
-- Apply global defaults (host/port/user/password/retention/backup dir).
+- Apply global defaults (host/port/user/password/retention/backup dir/pg_dump version).
 - Execute `pg_backup.sh` per entry in `backups[]`.
 - Allow per-job overrides and extra options.
 
@@ -58,6 +65,7 @@ This directory contains two Bash scripts for PostgreSQL backups:
 
 Options:
 - `-c`, `--config <path>` (default: `/usr/local/etc/pg_backup.json`)
+- `-v`, `--version` (print script version and exit)
 - `-h`, `--help`
 
 ### Dependencies
@@ -70,13 +78,14 @@ Global fields:
 - `backup_script`: path to `pg_backup.sh` (default `/usr/local/bin/pg_backup.sh`)
 - `backup_root`: default backup directory
 - `default_retention`: default retention (for example `14d`)
+- `default_pg_dump_version`: default `pg_dump` version string, for example `13.23` (from `pg_dump --version`)
 - `default_host`, `default_port`, `default_user`, `default_password`
 - `global_dry_run`: if `true`, appends `--dry-run` to each backup unless already present in per-job `options`
 
 Per backup entry (`backups[]`) fields:
 - `name`: label used in logs
 - `database`: database name (required)
-- Optional overrides: `host`, `port`, `user`, `password`, `backup_dir`, `retention_time`
+- Optional overrides: `host`, `port`, `user`, `password`, `backup_dir`, `retention_time`, `pg_dump_version`
 - `options`: array of extra CLI options passed directly to `pg_backup.sh` (for example `["--dry-run"]`)
 
 Minimal valid example:
@@ -85,6 +94,7 @@ Minimal valid example:
   "backup_script": "/usr/local/bin/pg_backup.sh",
   "backup_root": "/var/local/backup/postgresql/dumps",
   "default_retention": "14d",
+  "default_pg_dump_version": "13.23",
   "default_host": "db.example.com",
   "default_port": 5432,
   "default_user": "backupuser",
@@ -104,6 +114,7 @@ Minimal valid example:
       "database": "erpdb",
       "backup_dir": "/srv/backups",
       "retention_time": "30d",
+      "pg_dump_version": "14.18",
       "options": ["--dry-run"]
     }
   ]

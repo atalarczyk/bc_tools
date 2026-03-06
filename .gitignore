@@ -1,2 +1,4 @@
 pg_backup/pg_backup_weekly.json
 pg_backup/pg_backup_daily.json
+pg_backup/backup
+pg_backup/pg_backup.json.test
