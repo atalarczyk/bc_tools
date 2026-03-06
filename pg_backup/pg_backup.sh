@@ -30,7 +30,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.3"
 
 #------------------------------------------------------------------------------
 # Helper: print usage
@@ -178,6 +178,27 @@ get_pg_dump_version() {
   fi
 }
 
+pg_dump_supports_d_option() {
+  local version="$1" major="" minor="0"
+  if [[ ! "$version" =~ ^([0-9]+)([.]([0-9]+))? ]]; then
+    # If version parsing fails, assume modern behavior.
+    return 0
+  fi
+
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[3]:-0}"
+
+  if (( major > 9 )); then
+    return 0
+  fi
+
+  if (( major < 9 )); then
+    return 1
+  fi
+
+  (( minor >= 3 ))
+}
+
 declare -a PG_DUMP_BINARIES=()
 declare -a PG_DUMP_VERSIONS=()
 declare -A PG_DUMP_SEEN=()
@@ -228,7 +249,7 @@ discover_pg_dump_binaries() {
     done
   done
 
-  for candidate in /usr/lib/postgresql/*/bin/pg_dump /usr/pgsql-*/bin/pg_dump; do
+  for candidate in /usr/lib/postgresql/*/bin/pg_dump /usr/pgsql-*/bin/pg_dump /opt/postgresql-*/bin/pg_dump; do
     [[ -x "$candidate" ]] || continue
     add_pg_dump_candidate "$candidate"
   done
@@ -348,14 +369,24 @@ EOF
 else
   log "Starting backup of '${DB_NAME}' from '${DB_HOST}:${DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
   export PGPASSWORD="$DB_PASS"
-  if ! "$SELECTED_PG_DUMP_BIN" \
-    -h "$DB_HOST" \
-    -p "$DB_PORT" \
-    -U "$DB_USER" \
-    -d "$DB_NAME" \
-    -Fc -Z 9 \
-    --no-owner --no-privileges \
-    -f "$OUTFILE"; then
+  PG_DUMP_CMD=(
+    "$SELECTED_PG_DUMP_BIN"
+    -h "$DB_HOST"
+    -p "$DB_PORT"
+    -U "$DB_USER"
+    -Fc -Z 9
+    --no-owner --no-privileges
+    -f "$OUTFILE"
+  )
+
+  if pg_dump_supports_d_option "$SELECTED_PG_DUMP_VERSION"; then
+    PG_DUMP_CMD+=(-d "$DB_NAME")
+  else
+    PG_DUMP_CMD+=("$DB_NAME")
+  fi
+
+  if ! "${PG_DUMP_CMD[@]}"; then
+    unset PGPASSWORD
     log "ERROR: pg_dump failed." >&2
     exit 1
   fi
@@ -370,7 +401,10 @@ if [[ ! -s "$OUTFILE" ]]; then
   exit 1
 fi
 
-sha256sum "$OUTFILE" > "$CHKSUM"
+(
+  cd "$BACKUP_DIR"
+  sha256sum "$(basename "$OUTFILE")"
+) > "$CHKSUM"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   log "[DRY-RUN] Dummy backup created: $OUTFILE"
