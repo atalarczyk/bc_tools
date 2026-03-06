@@ -170,7 +170,7 @@ fi
 
 TS="$(date -u +'%Y%m%dT%H%M%SZ')"
 OUTFILE="${BACKUP_DIR}/${DB_NAME}-${TS}.dump"
-CHKSUM="${DB_NAME}-${TS}.dump.sha256"
+CHKSUM="${BACKUP_DIR}/${DB_NAME}-${TS}.dump.sha256"
 
 #------------------------------------------------------------------------------
 # Backup or simulate

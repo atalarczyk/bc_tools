@@ -1,0 +1,130 @@
+# PostgreSQL Backup Scripts
+
+This directory contains two Bash scripts for PostgreSQL backups:
+
+- `pg_backup.sh`: runs a single database backup, creates a checksum, and removes old files based on retention.
+- `run_pg_backups.sh`: reads a JSON config and runs `pg_backup.sh` for multiple databases.
+
+## 1) `pg_backup.sh` (single database backup)
+
+### Purpose
+- Create a timestamped PostgreSQL dump (`pg_dump -Fc -Z 9`).
+- Optionally run in `--dry-run` mode (creates a dummy file, no DB connection).
+- Create SHA256 checksum file.
+- Prune old dump/checksum files older than `--retention-time`.
+- Prevent concurrent runs for the same database using `flock`.
+
+### Required options
+- `--database-server <host>`
+- `--database-user <user>`
+- `--database-password <password>`
+- `--database-name <dbname>`
+- `--backup-dir <path>`
+- `--retention-time <time>` (examples: `14d`, `2w`, `36h`, `90m`, `7` where plain number means days)
+
+### Optional options
+- `--database-port <port>` (default: `5432`)
+- `--dry-run`
+- `-h`, `--help`
+
+### Example
+```bash
+./pg_backup.sh \
+  --database-server db.example.com \
+  --database-port 5432 \
+  --database-user backupuser \
+  --database-password 'S3cret!' \
+  --database-name mydb \
+  --backup-dir /var/local/backup/postgresql/dumps \
+  --retention-time 14d
+```
+
+### Dependencies
+- `bash`, `find`, `date`, `flock`, `sha256sum`
+- `pg_dump` (not required in `--dry-run`)
+
+## 2) `run_pg_backups.sh` (multi database runner)
+
+### Purpose
+- Read a JSON config file.
+- Apply global defaults (host/port/user/password/retention/backup dir).
+- Execute `pg_backup.sh` per entry in `backups[]`.
+- Allow per-job overrides and extra options.
+
+### Usage
+```bash
+./run_pg_backups.sh --config /usr/local/etc/pg_backup.json
+```
+
+Options:
+- `-c`, `--config <path>` (default: `/usr/local/etc/pg_backup.json`)
+- `-h`, `--help`
+
+### Dependencies
+- `bash`, `jq`
+- executable `pg_backup.sh` path defined in JSON (`backup_script`)
+
+## 3) JSON config structure (`pg_backup.json`)
+
+Global fields:
+- `backup_script`: path to `pg_backup.sh` (default `/usr/local/bin/pg_backup.sh`)
+- `backup_root`: default backup directory
+- `default_retention`: default retention (for example `14d`)
+- `default_host`, `default_port`, `default_user`, `default_password`
+- `global_dry_run`: if `true`, appends `--dry-run` to each backup unless already present in per-job `options`
+
+Per backup entry (`backups[]`) fields:
+- `name`: label used in logs
+- `database`: database name (required)
+- Optional overrides: `host`, `port`, `user`, `password`, `backup_dir`, `retention_time`
+- `options`: array of extra CLI options passed directly to `pg_backup.sh` (for example `["--dry-run"]`)
+
+Minimal valid example:
+```json
+{
+  "backup_script": "/usr/local/bin/pg_backup.sh",
+  "backup_root": "/var/local/backup/postgresql/dumps",
+  "default_retention": "14d",
+  "default_host": "db.example.com",
+  "default_port": 5432,
+  "default_user": "backupuser",
+  "default_password": "S3cret!",
+  "global_dry_run": false,
+  "backups": [
+    {
+      "name": "mydb1",
+      "database": "mydb1"
+    },
+    {
+      "name": "erpdb",
+      "host": "erpserver.local",
+      "port": 5433,
+      "user": "pgadmin",
+      "password": "AdminPass",
+      "database": "erpdb",
+      "backup_dir": "/srv/backups",
+      "retention_time": "30d",
+      "options": ["--dry-run"]
+    }
+  ]
+}
+```
+
+## 4) Typical flow
+
+1. Prepare config JSON.
+2. Make scripts executable:
+```bash
+chmod +x pg_backup.sh run_pg_backups.sh
+```
+3. Run once manually:
+```bash
+./run_pg_backups.sh --config /path/to/pg_backup.json
+```
+4. Add to cron/systemd timer if needed.
+
+## 5) Notes from current implementation
+
+- `run_pg_backups.sh` skips entries missing `host/user/password/database`.
+- Script logs contain Polish messages.
+- `pg_backup.sh` writes checksum files next to dump files in the database backup directory.

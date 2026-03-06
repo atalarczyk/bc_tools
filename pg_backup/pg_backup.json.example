@@ -13,7 +13,7 @@
   "backups": [
     {
       "name": "mydb1",
-      "database": "mydb1",
+      "database": "mydb1"
     },
     {
       "name": "mydb2",
