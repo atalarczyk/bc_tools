@@ -1,0 +1,35 @@
+{
+  "backup_script": "/usr/local/bin/pg_backup.sh",
+  "backup_root": "/var/local/backup/postgresql/dumps/",
+  "default_retention": "14d",
+
+  "default_host": "db.example.com",
+  "default_port": 5432,
+  "default_user": "backupuser",
+  "default_password": "S3cret!",
+
+  "global_dry_run": false,
+
+  "backups": [
+    {
+      "name": "mydb1",
+      "database": "mydb1",
+    },
+    {
+      "name": "mydb2",
+      "database": "mydb2",
+      "retention_time": "7d"
+    },
+    {
+      "name": "erpdb",
+      "host": "erpserver.local",
+      "port": 5433,
+      "user": "pgadmin",
+      "password": "AdminPass",
+      "database": "erpdb",
+      "backup_dir": "/srv/backups",
+      "retention_time": "30d",
+      "options": ["--dry-run"]
+    }
+  ]
+}
