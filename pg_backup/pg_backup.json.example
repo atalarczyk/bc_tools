@@ -11,6 +11,12 @@
 
   "global_dry_run": false,
 
+  "default_ssh_host": null,
+  "default_ssh_port": 22,
+  "default_ssh_user": null,
+  "default_ssh_key": null,
+  "default_ssh_password": null,
+
   "backups": [
     {
       "name": "mydb1",
@@ -32,6 +38,23 @@
       "retention_time": "30d",
       "pg_dump_version": "14.18",
       "options": ["--dry-run"]
+    },
+    {
+      "name": "remote-via-tunnel",
+      "host": "db.internal",
+      "database": "appdb",
+      "ssh_host": "jump.example.com",
+      "ssh_port": 22,
+      "ssh_user": "tunnel",
+      "ssh_key": "/root/.ssh/id_backup"
+    },
+    {
+      "name": "remote-via-tunnel-password",
+      "host": "db.internal",
+      "database": "appdb2",
+      "ssh_host": "jump.example.com",
+      "ssh_user": "tunnel",
+      "ssh_password": "SshPass!"
     }
   ]
 }

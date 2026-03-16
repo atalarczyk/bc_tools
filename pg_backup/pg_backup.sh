@@ -30,7 +30,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.2.0"
 
 #------------------------------------------------------------------------------
 # Helper: print usage
@@ -58,6 +58,15 @@ Optional:
   --dry-run                         Do not connect to PostgreSQL, create dummy file
   -h, --help                        Show this help and exit
 
+SSH tunnel (optional — activated when --ssh-host is provided):
+  --ssh-host          <host>        SSH server to tunnel through
+  --ssh-port          <port>        SSH port (default: 22)
+  --ssh-user          <user>        SSH username (default: current OS user)
+  --ssh-key           <path>        Path to SSH private key
+  --ssh-password      <password>    SSH password (requires sshpass; mutually
+                                    exclusive with --ssh-key)
+  --ssh-local-port    <port>        Local port for the tunnel (default: auto)
+
 Examples:
   pg_backup.sh --database-server db.example.com \
                --database-port 5432 \
@@ -76,6 +85,16 @@ Examples:
   pg_backup.sh -pv 13.23 --database-server db.example.com \
                --database-user backupuser --database-password 'S3cret!' \
                --database-name mydb --backup-dir /mnt/dane/Backup --retention-time 14d
+
+  pg_backup.sh --database-server db.internal \
+               --database-user backupuser --database-password 'S3cret!' \
+               --database-name mydb --backup-dir /mnt/dane/Backup --retention-time 14d \
+               --ssh-host jump.example.com --ssh-user tunnel --ssh-key ~/.ssh/id_backup
+
+  pg_backup.sh --database-server db.internal \
+               --database-user backupuser --database-password 'S3cret!' \
+               --database-name mydb --backup-dir /mnt/dane/Backup --retention-time 14d \
+               --ssh-host jump.example.com --ssh-user tunnel --ssh-password 'SshPass!'
 EOF
 }
 
@@ -94,6 +113,7 @@ DRY_RUN=0
 PRINT_PG_DUMP_VERSIONS=0
 PG_DUMP_VERSION_REQUEST=""
 DB_HOST="" DB_PORT=5432 DB_USER="" DB_PASS="" DB_NAME="" BACKUP_ROOT="" RETENTION_RAW=""
+SSH_HOST="" SSH_PORT=22 SSH_USER="" SSH_KEY="" SSH_PASS="" SSH_LOCAL_PORT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -114,6 +134,12 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
+    --ssh-host)          SSH_HOST="$2"; shift 2 ;;
+    --ssh-port)          SSH_PORT="$2"; shift 2 ;;
+    --ssh-user)          SSH_USER="$2"; shift 2 ;;
+    --ssh-key)           SSH_KEY="$2"; shift 2 ;;
+    --ssh-password)      SSH_PASS="$2"; shift 2 ;;
+    --ssh-local-port)    SSH_LOCAL_PORT="$2"; shift 2 ;;
     -v|--version)       echo "$SCRIPT_VERSION"; exit 0 ;;
     --dry-run)           DRY_RUN=1; shift ;;
     -h|--help)           usage; exit 0 ;;
@@ -297,6 +323,33 @@ select_pg_dump_version() {
 }
 
 #------------------------------------------------------------------------------
+# Validate SSH tunnel parameters
+#------------------------------------------------------------------------------
+SSH_TUNNEL_PID=""
+if [[ -n "$SSH_HOST" ]]; then
+  if [[ -n "$SSH_KEY" && -n "$SSH_PASS" ]]; then
+    echo "ERROR: --ssh-key and --ssh-password are mutually exclusive." >&2
+    exit 64
+  fi
+  if [[ -n "$SSH_KEY" && ! -r "$SSH_KEY" ]]; then
+    echo "ERROR: SSH key file not found or not readable: $SSH_KEY" >&2
+    exit 64
+  fi
+  if [[ -n "$SSH_PASS" ]]; then
+    if ! command -v sshpass >/dev/null 2>&1; then
+      cat >&2 <<'SSHPASS_MSG'
+ERROR: 'sshpass' is required for SSH password authentication but was not found.
+       Install it with: sudo apt install sshpass   (Debian/Ubuntu)
+                        sudo yum install sshpass   (RHEL/CentOS)
+                        brew install sshpass       (macOS with Homebrew)
+SSHPASS_MSG
+      exit 127
+    fi
+  fi
+  require_cmd ssh
+fi
+
+#------------------------------------------------------------------------------
 # Prerequisites
 #------------------------------------------------------------------------------
 require_cmd find
@@ -349,6 +402,72 @@ OUTFILE="${BACKUP_DIR}/${DB_NAME}-${TS}.dump"
 CHKSUM="${BACKUP_DIR}/${DB_NAME}-${TS}.dump.sha256"
 
 #------------------------------------------------------------------------------
+# SSH tunnel (optional)
+#------------------------------------------------------------------------------
+ORIGINAL_DB_HOST="$DB_HOST"
+ORIGINAL_DB_PORT="$DB_PORT"
+
+if [[ -n "$SSH_HOST" ]]; then
+  # Pick a local port if not specified
+  if [[ -z "$SSH_LOCAL_PORT" ]]; then
+    SSH_LOCAL_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()' 2>/dev/null \
+      || shuf -i 49152-65535 -n 1)"
+  fi
+
+  # Build the SSH command
+  SSH_TARGET="${SSH_USER:+${SSH_USER}@}${SSH_HOST}"
+  SSH_CMD=(ssh
+    -f -N
+    -o ExitOnForwardFailure=yes
+    -o StrictHostKeyChecking=accept-new
+    -p "$SSH_PORT"
+    -L "127.0.0.1:${SSH_LOCAL_PORT}:${DB_HOST}:${DB_PORT}"
+  )
+  [[ -n "$SSH_KEY" ]] && SSH_CMD+=(-i "$SSH_KEY")
+  [[ -n "$SSH_PASS" ]] && SSH_CMD=( sshpass -p "$SSH_PASS" "${SSH_CMD[@]}" -o PreferredAuthentications=password )
+  SSH_CMD+=("$SSH_TARGET")
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "[DRY-RUN] Would open SSH tunnel: ${SSH_CMD[*]}"
+    log "[DRY-RUN] pg_dump would connect to 127.0.0.1:${SSH_LOCAL_PORT} instead of ${DB_HOST}:${DB_PORT}"
+  else
+    log "Opening SSH tunnel via ${SSH_TARGET}:${SSH_PORT} — local port ${SSH_LOCAL_PORT} -> ${DB_HOST}:${DB_PORT} ..."
+    if ! "${SSH_CMD[@]}"; then
+      log "ERROR: Failed to establish SSH tunnel." >&2
+      exit 1
+    fi
+
+    # Find the backgrounded ssh process listening on our local port
+    SSH_TUNNEL_PID="$(
+      lsof -ti "TCP:${SSH_LOCAL_PORT}" -sTCP:LISTEN 2>/dev/null \
+        || ss -tlnp "sport = :${SSH_LOCAL_PORT}" 2>/dev/null | grep -oP 'pid=\K[0-9]+' \
+        || true
+    )"
+    # shellcheck disable=SC2064
+    trap "kill $SSH_TUNNEL_PID 2>/dev/null || true" EXIT
+
+    # Wait for the tunnel to be ready (up to 5 seconds)
+    local_ready=0
+    for _ in 1 2 3 4 5; do
+      if (echo >/dev/tcp/127.0.0.1/"$SSH_LOCAL_PORT") 2>/dev/null; then
+        local_ready=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$local_ready" -eq 0 ]]; then
+      log "ERROR: SSH tunnel opened but local port ${SSH_LOCAL_PORT} is not responding." >&2
+      exit 1
+    fi
+    log "SSH tunnel established (PID ${SSH_TUNNEL_PID:-unknown})."
+  fi
+
+  # Redirect pg_dump to use the tunnel
+  DB_HOST="127.0.0.1"
+  DB_PORT="$SSH_LOCAL_PORT"
+fi
+
+#------------------------------------------------------------------------------
 # Backup or simulate
 #------------------------------------------------------------------------------
 PG_DUMP_LOG_INFO="pg_dump=not-found"
@@ -357,17 +476,17 @@ if [[ -n "$SELECTED_PG_DUMP_BIN" ]]; then
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  log "[DRY-RUN] Simulating backup for '${DB_NAME}' on '${DB_HOST}:${DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
+  log "[DRY-RUN] Simulating backup for '${DB_NAME}' on '${ORIGINAL_DB_HOST}:${ORIGINAL_DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
   cat > "$OUTFILE" <<EOF
 [DRY-RUN] PostgreSQL Backup Simulation
 Database:   $DB_NAME
-Server:     $DB_HOST
-Port:       $DB_PORT
+Server:     $ORIGINAL_DB_HOST
+Port:       $ORIGINAL_DB_PORT
 User:       $DB_USER
 Timestamp:  $TS
 EOF
 else
-  log "Starting backup of '${DB_NAME}' from '${DB_HOST}:${DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
+  log "Starting backup of '${DB_NAME}' from '${ORIGINAL_DB_HOST}:${ORIGINAL_DB_PORT}' using ${PG_DUMP_LOG_INFO} ..."
   export PGPASSWORD="$DB_PASS"
   PG_DUMP_CMD=(
     "$SELECTED_PG_DUMP_BIN"

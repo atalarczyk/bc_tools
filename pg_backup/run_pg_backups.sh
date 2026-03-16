@@ -7,7 +7,7 @@
 #------------------------------------------------------------------------------
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 DEFAULT_CONFIG="/usr/local/etc/pg_backup.json"
 CONFIG_FILE="$DEFAULT_CONFIG"
@@ -48,6 +48,12 @@ DEFAULT_PASS=$(jq -r '.default_password // null' "$CONFIG_FILE")
 
 GLOBAL_DRY_RUN=$(jq -r '.global_dry_run // false' "$CONFIG_FILE")
 
+DEFAULT_SSH_HOST=$(jq -r '.default_ssh_host // null' "$CONFIG_FILE")
+DEFAULT_SSH_PORT=$(jq -r '.default_ssh_port // 22' "$CONFIG_FILE")
+DEFAULT_SSH_USER=$(jq -r '.default_ssh_user // null' "$CONFIG_FILE")
+DEFAULT_SSH_KEY=$(jq -r '.default_ssh_key // null' "$CONFIG_FILE")
+DEFAULT_SSH_PASS=$(jq -r '.default_ssh_password // null' "$CONFIG_FILE")
+
 [[ -x "$BACKUP_SCRIPT" ]] || { log "❌ ERROR: Skrypt $BACKUP_SCRIPT nie jest wykonywalny"; exit 1; }
 
 BACKUP_COUNT=$(jq '.backups | length' "$CONFIG_FILE")
@@ -77,6 +83,13 @@ for i in $(seq 0 $((BACKUP_COUNT - 1))); do
   RETENTION=$(jq -r ".backups[$i].retention_time // \"$RETENTION_DEFAULT\"" "$CONFIG_FILE")
   PG_DUMP_VERSION=$(jq -r --arg default "$PG_DUMP_VERSION_DEFAULT" ".backups[$i].pg_dump_version // \$default // empty" "$CONFIG_FILE")
 
+  SSH_HOST=$(jq -r --arg default "$DEFAULT_SSH_HOST" ".backups[$i].ssh_host // \$default" "$CONFIG_FILE")
+  SSH_PORT=$(jq -r --arg default "$DEFAULT_SSH_PORT" ".backups[$i].ssh_port // \$default" "$CONFIG_FILE")
+  SSH_USER=$(jq -r --arg default "$DEFAULT_SSH_USER" ".backups[$i].ssh_user // \$default" "$CONFIG_FILE")
+  SSH_KEY=$(jq -r --arg default "$DEFAULT_SSH_KEY" ".backups[$i].ssh_key // \$default" "$CONFIG_FILE")
+  SSH_PASS=$(jq -r --arg default "$DEFAULT_SSH_PASS" ".backups[$i].ssh_password // \$default" "$CONFIG_FILE")
+  SSH_LOCAL_PORT=$(jq -r ".backups[$i].ssh_local_port // empty" "$CONFIG_FILE")
+
   # walidacja
   if [[ -z "$HOST" || -z "$USER" || -z "$PASS" || -z "$DBNAME" ]]; then
     log "⚠️  [$NAME] Pominięto: brak wymaganych pól (host/user/pass/database)"
@@ -91,7 +104,11 @@ for i in $(seq 0 $((BACKUP_COUNT - 1))); do
     OPTIONS+=("--dry-run")
   fi
 
-  log "⏩  [$NAME] host=$HOST port=$PORT db=$DBNAME retention=$RETENTION pg_dump=${PG_DUMP_VERSION:-<domyślny z PATH>} dir=$BACKUP_DIR opts=${OPTIONS[*]:-—}"
+  SSH_INFO="none"
+  if [[ -n "$SSH_HOST" && "$SSH_HOST" != "null" ]]; then
+    SSH_INFO="${SSH_USER:+${SSH_USER}@}${SSH_HOST}:${SSH_PORT}"
+  fi
+  log "⏩  [$NAME] host=$HOST port=$PORT db=$DBNAME retention=$RETENTION pg_dump=${PG_DUMP_VERSION:-<domyślny z PATH>} ssh=${SSH_INFO} dir=$BACKUP_DIR opts=${OPTIONS[*]:-—}"
 
   CMD=(
     "$BACKUP_SCRIPT"
@@ -104,6 +121,13 @@ for i in $(seq 0 $((BACKUP_COUNT - 1))); do
     --retention-time "$RETENTION"
   )
   [[ -n "$PG_DUMP_VERSION" ]] && CMD+=(--pg-dump-version "$PG_DUMP_VERSION")
+  if [[ -n "$SSH_HOST" && "$SSH_HOST" != "null" ]]; then
+    CMD+=(--ssh-host "$SSH_HOST" --ssh-port "$SSH_PORT")
+    [[ -n "$SSH_USER" && "$SSH_USER" != "null" ]] && CMD+=(--ssh-user "$SSH_USER")
+    [[ -n "$SSH_KEY" && "$SSH_KEY" != "null" ]] && CMD+=(--ssh-key "$SSH_KEY")
+    [[ -n "$SSH_PASS" && "$SSH_PASS" != "null" ]] && CMD+=(--ssh-password "$SSH_PASS")
+    [[ -n "$SSH_LOCAL_PORT" ]] && CMD+=(--ssh-local-port "$SSH_LOCAL_PORT")
+  fi
   CMD+=("${OPTIONS[@]}")
 
   if "${CMD[@]}"; then
