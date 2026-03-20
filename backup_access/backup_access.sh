@@ -16,7 +16,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 readonly SCRIPT_NAME="backup_access"
 readonly MARKER_BEGIN="# BEGIN ${SCRIPT_NAME}"
 readonly MARKER_END="# END ${SCRIPT_NAME}"
@@ -53,6 +53,7 @@ FINDMNT_BIN="${FINDMNT_BIN:-/bin/findmnt}"
 CHOWN_BIN="${CHOWN_BIN:-/bin/chown}"
 CHMOD_BIN="${CHMOD_BIN:-/bin/chmod}"
 INSTALL_BIN="${INSTALL_BIN:-/usr/bin/install}"
+STAT_BIN="${STAT_BIN:-/usr/bin/stat}"
 # BA_SKIP_ROOT_CHECK=1  overrides require_root (testing only)
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,10 @@ cmd_adduser()    { "${ADDUSER_BIN}" "$@"; }
 cmd_userdel()    { "${USERDEL_BIN}" "$@"; }
 cmd_sshd_test()  { "${SSHD_BIN}" "$@"; }
 cmd_systemctl()  { "${SYSTEMCTL_BIN}" "$@"; }
+cmd_stat()       { "${STAT_BIN}" "$@"; }
+
+get_owner() { cmd_stat -c '%U:%G' "$1" 2>/dev/null; }
+get_perms() { cmd_stat -c '%a' "$1" 2>/dev/null; }
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -1082,6 +1087,200 @@ cmd_admin_recreate_mounts() {
 }
 
 # ---------------------------------------------------------------------------
+# COMMAND: admin-check-all
+# ---------------------------------------------------------------------------
+CHECK_FAIL_COUNT=0
+
+_check_ok() {
+    log_verbose "[OK] $*"
+}
+
+_check_fail() {
+    printf '[FAIL] %s\n' "$*" >&2
+    (( CHECK_FAIL_COUNT++ )) || true
+}
+
+_check_user() {
+    local username="$1"
+    printf '[CHECK] === %s ===\n' "${username}" >&2
+
+    # 1. OS user exists
+    if user_exists "${username}"; then
+        _check_ok "${username}: OS user exists"
+    else
+        _check_fail "${username}: OS user missing"
+    fi
+
+    # 2. sshd_config block exists
+    if has_managed_block "${OPT_SSH_CONFIG}" "${username}"; then
+        _check_ok "${username}: sshd_config block present"
+    else
+        _check_fail "${username}: sshd_config block missing"
+    fi
+
+    # 3. sshd_config block not duplicated
+    local sshd_count
+    sshd_count=$(count_managed_blocks "${OPT_SSH_CONFIG}" "${username}")
+    if [[ "${sshd_count}" -le 1 ]]; then
+        _check_ok "${username}: sshd_config block count OK (${sshd_count})"
+    else
+        _check_fail "${username}: sshd_config has ${sshd_count} duplicate blocks"
+    fi
+
+    # 4. systemd service block exists
+    if has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}"; then
+        _check_ok "${username}: systemd service block present"
+    else
+        _check_fail "${username}: systemd service block missing"
+    fi
+
+    # 5. systemd service block not duplicated
+    local service_count
+    service_count=$(count_managed_blocks "${SYSTEMD_SERVICE_FILE}" "${username}")
+    if [[ "${service_count}" -le 1 ]]; then
+        _check_ok "${username}: systemd service block count OK (${service_count})"
+    else
+        _check_fail "${username}: systemd service has ${service_count} duplicate blocks"
+    fi
+
+    # 6. Source directory exists
+    local source_dir
+    source_dir=$(get_service_source_dir "${username}")
+    if [[ -n "${source_dir}" ]]; then
+        if [[ -d "${source_dir}" ]]; then
+            _check_ok "${username}: source directory exists (${source_dir})"
+        else
+            _check_fail "${username}: source directory missing: ${source_dir}"
+        fi
+    else
+        _check_fail "${username}: no source directory found in service block"
+    fi
+
+    # 7. Chroot base dir exists
+    local chroot_dir="${OPT_REMOUNT_ROOT}/${username}"
+    if [[ -d "${chroot_dir}" ]]; then
+        _check_ok "${username}: chroot directory exists"
+    else
+        _check_fail "${username}: chroot directory missing: ${chroot_dir}"
+    fi
+
+    # 8. Chroot base dir ownership and permissions
+    if [[ -d "${chroot_dir}" ]]; then
+        local owner perms
+        owner=$(get_owner "${chroot_dir}")
+        perms=$(get_perms "${chroot_dir}")
+        if [[ "${owner}" == "root:root" ]]; then
+            _check_ok "${username}: chroot dir owner is root:root"
+        else
+            _check_fail "${username}: chroot dir owner is ${owner} (expected root:root)"
+        fi
+        if [[ "${perms}" == "755" ]]; then
+            _check_ok "${username}: chroot dir mode is 755"
+        else
+            _check_fail "${username}: chroot dir mode is ${perms} (expected 755)"
+        fi
+    fi
+
+    # 9. Backups mountpoint dir exists
+    local mp="${chroot_dir}/backups"
+    if [[ -d "${mp}" ]]; then
+        _check_ok "${username}: backups mountpoint exists"
+    else
+        _check_fail "${username}: backups mountpoint missing: ${mp}"
+    fi
+
+    # 10. Backups mountpoint ownership and permissions
+    if [[ -d "${mp}" ]]; then
+        local mp_owner mp_perms
+        mp_owner=$(get_owner "${mp}")
+        mp_perms=$(get_perms "${mp}")
+        if [[ "${mp_owner}" == "root:root" ]]; then
+            _check_ok "${username}: backups dir owner is root:root"
+        else
+            _check_fail "${username}: backups dir owner is ${mp_owner} (expected root:root)"
+        fi
+        if [[ "${mp_perms}" == "755" ]]; then
+            _check_ok "${username}: backups dir mode is 755"
+        else
+            _check_fail "${username}: backups dir mode is ${mp_perms} (expected 755)"
+        fi
+    fi
+
+    # 11. Authorized key file exists
+    local key_file="${OPT_AUTHORIZED_KEYS_DIR}/${username}"
+    if [[ -f "${key_file}" ]]; then
+        _check_ok "${username}: authorized key file exists"
+    else
+        _check_fail "${username}: authorized key file missing: ${key_file}"
+    fi
+
+    # 12. Authorized key file ownership and permissions
+    if [[ -f "${key_file}" ]]; then
+        local kf_owner kf_perms
+        kf_owner=$(get_owner "${key_file}")
+        kf_perms=$(get_perms "${key_file}")
+        if [[ "${kf_owner}" == "root:root" ]]; then
+            _check_ok "${username}: key file owner is root:root"
+        else
+            _check_fail "${username}: key file owner is ${kf_owner} (expected root:root)"
+        fi
+        if [[ "${kf_perms}" == "644" ]]; then
+            _check_ok "${username}: key file mode is 644"
+        else
+            _check_fail "${username}: key file mode is ${kf_perms} (expected 644)"
+        fi
+    fi
+
+    # 13. Authorized key file is non-empty
+    if [[ -f "${key_file}" ]]; then
+        if [[ -s "${key_file}" ]]; then
+            _check_ok "${username}: key file is non-empty"
+        else
+            _check_fail "${username}: key file is empty"
+        fi
+    fi
+
+    # 14. Mount is active
+    if is_mounted "${mp}"; then
+        _check_ok "${username}: mount is active"
+    else
+        _check_fail "${username}: mount is NOT active: ${mp}"
+    fi
+}
+
+cmd_admin_check_all() {
+    validate_absolute_path "${OPT_REMOUNT_ROOT}" "--remount-root"
+    validate_absolute_path "${OPT_SSH_CONFIG}"   "--ssh-config"
+
+    local ssh_users service_users all_users
+    ssh_users=$(get_managed_users_from_file "${OPT_SSH_CONFIG}")
+    service_users=$(get_managed_users_from_file "${SYSTEMD_SERVICE_FILE}")
+
+    all_users=$(printf '%s\n%s\n' "${ssh_users}" "${service_users}" \
+        | sort -u | grep -v '^$') || true
+
+    if [[ -z "${all_users}" ]]; then
+        log_info "No managed users found; nothing to check"
+        return 0
+    fi
+
+    CHECK_FAIL_COUNT=0
+    local users_checked=0
+
+    local username
+    while IFS= read -r username; do
+        [[ -z "${username}" ]] && continue
+        _check_user "${username}"
+        (( users_checked++ )) || true
+    done <<< "${all_users}"
+
+    printf '\n=== Summary: %d users checked, %d problems found ===\n' \
+        "${users_checked}" "${CHECK_FAIL_COUNT}" >&2
+
+    [[ "${CHECK_FAIL_COUNT}" -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
 # require_root
 # ---------------------------------------------------------------------------
 require_root() {
@@ -1108,6 +1307,10 @@ COMMANDS
     admin-recreate-mounts
                   Reconcile systemd mount service with managed accounts:
                   mount unmounted entries, remove orphaned entries
+    admin-check-all
+                  Verify all managed users have correct, complete configuration.
+                  Checks OS user, config blocks, directories, permissions, keys,
+                  and mounts. Use --verbose for [OK] details.
     -h, --help    Show this help message (may appear as first argument only)
     -i, --info    Show version and exit
 
@@ -1181,8 +1384,8 @@ parse_args() {
     case "$1" in
         -h|--help)            print_help; exit 0 ;;
         -i|--info)            printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"; exit 0 ;;
-        list|add|modify|delete|admin-recreate-mounts) COMMAND="$1"; shift ;;
-        *) die "First argument must be a command: list add modify delete admin-recreate-mounts -h --help -i --info  (got: '$1')" ;;
+        list|add|modify|delete|admin-recreate-mounts|admin-check-all) COMMAND="$1"; shift ;;
+        *) die "First argument must be a command: list add modify delete admin-recreate-mounts admin-check-all -h --help -i --info  (got: '$1')" ;;
     esac
 
     # Parse remaining options
@@ -1232,6 +1435,7 @@ main() {
         modify) require_root; cmd_modify ;;
         delete) require_root; cmd_delete ;;
         admin-recreate-mounts) require_root; cmd_admin_recreate_mounts ;;
+        admin-check-all) require_root; cmd_admin_check_all ;;
     esac
 }
 

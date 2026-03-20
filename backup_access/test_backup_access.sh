@@ -29,6 +29,7 @@ TMPBASE=""        # set in setup_fixtures
 FAKE_BIN=""
 FAKE_MOUNTS=""    # file tracking fake-mounted paths
 FAKE_LOG=""       # log of stub invocations
+FAKE_STAT_REGISTRY=""  # registry for fake stat results
 SSHD_CFG=""
 SYSTEMD_SERVICE=""
 AUTHKEYS_DIR=""
@@ -135,9 +136,10 @@ setup_fixtures() {
     AUTHKEYS_DIR="${TMPBASE}/authorized_keys"
     REMOUNT_ROOT="${TMPBASE}/sftp"
     BACKUP_SRC="${TMPBASE}/backup_src"
+    FAKE_STAT_REGISTRY="${TMPBASE}/stat_registry"
 
     mkdir -p "${FAKE_BIN}" "${AUTHKEYS_DIR}" "${REMOUNT_ROOT}" "${BACKUP_SRC}"
-    touch "${FAKE_MOUNTS}" "${FAKE_LOG}"
+    touch "${FAKE_MOUNTS}" "${FAKE_LOG}" "${FAKE_STAT_REGISTRY}"
     printf '%s' "${SSHD_CFG_MINIMAL}" > "${SSHD_CFG}"
 
     _write_fake_commands
@@ -238,6 +240,37 @@ STUB
 printf 'systemctl %s\n' "\$*" >> "${FAKE_LOG}"
 STUB
 
+    # fake stat: consult FAKE_STAT_REGISTRY (format: PATH OWNER:GROUP MODE)
+    # Default: root:root 755 for dirs, root:root 644 for files
+    cat > "${FAKE_BIN}/stat" <<STUB
+#!/usr/bin/env bash
+target="\${@: -1}"
+format=""
+for i in \$(seq 1 \$#); do
+    if [[ "\${!i}" == "-c" ]]; then
+        next=\$((i+1))
+        fmt="\${!next}"
+        case "\${fmt}" in
+            '%U:%G') format="owner" ;;
+            '%a')    format="perms" ;;
+        esac
+    fi
+done
+if [[ -f "${FAKE_STAT_REGISTRY}" ]]; then
+    while IFS=' ' read -r reg_path reg_owner reg_mode; do
+        if [[ "\${reg_path}" == "\${target}" ]]; then
+            if [[ "\${format}" == "owner" ]]; then printf '%s\n' "\${reg_owner}"; exit 0; fi
+            if [[ "\${format}" == "perms" ]]; then printf '%s\n' "\${reg_mode}"; exit 0; fi
+        fi
+    done < "${FAKE_STAT_REGISTRY}"
+fi
+if [[ -d "\${target}" ]]; then
+    [[ "\${format}" == "owner" ]] && printf 'root:root\n' || printf '755\n'
+else
+    [[ "\${format}" == "owner" ]] && printf 'root:root\n' || printf '644\n'
+fi
+STUB
+
     chmod +x "${FAKE_BIN}"/*
 }
 
@@ -278,6 +311,7 @@ run_sut() {
     CHOWN_BIN="${FAKE_BIN}/chown" \
     CHMOD_BIN="${FAKE_BIN}/chmod" \
     INSTALL_BIN="${FAKE_BIN}/install" \
+    STAT_BIN="${FAKE_BIN}/stat" \
     BA_SKIP_ROOT_CHECK=1 \
     PATH="${FAKE_BIN}:${PATH}" \
     bash "${SUT}" "$@"
@@ -1056,6 +1090,122 @@ test_admin_recreate_mounts() {
     reset_service
 }
 
+test_admin_check_all() {
+    printf '\n=== admin-check-all tests ===\n'
+    _write_fake_id
+    reset_sshd_cfg
+    reset_service
+    : > "${FAKE_STAT_REGISTRY}"
+
+    local SRC_A="${TMPBASE}/src_a" SRC_B="${TMPBASE}/src_b"
+    mkdir -p "${SRC_A}" "${SRC_B}"
+
+    # --- healthy: two users, everything OK ---
+    run_sut add -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" \
+        -u alice -k "${TEST_KEY_ED}" -d "${SRC_A}" >/dev/null 2>&1
+    run_sut add -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" \
+        -u bob   -k "${TEST_KEY_ED2}" -d "${SRC_B}" >/dev/null 2>&1
+
+    local out rc
+    rc=0; out=$(run_sut admin-check-all --verbose \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "healthy: exit 0" "0" "${rc}"
+    assert_contains "healthy: 0 problems" "0 problems found" "${out}"
+    assert_not_contains "healthy: no FAIL" "[FAIL]" "${out}"
+    assert_contains "healthy: OK lines present" "[OK]" "${out}"
+
+    # --- verbose vs default: without --verbose no [OK] lines ---
+    local out_quiet
+    rc=0; out_quiet=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "quiet: exit 0" "0" "${rc}"
+    assert_not_contains "quiet: no OK lines" "[OK]" "${out_quiet}"
+    assert_contains "quiet: summary present" "0 problems found" "${out_quiet}"
+
+    # --- missing OS user ---
+    grep -vxF "alice" "${TMPBASE}/users" > "${TMPBASE}/users.tmp" || true
+    mv "${TMPBASE}/users.tmp" "${TMPBASE}/users"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "missing os user: exit 1" "1" "${rc}"
+    assert_contains "missing os user: FAIL" "OS user missing" "${out}"
+
+    # Restore alice
+    printf 'alice\n' >> "${TMPBASE}/users"
+
+    # --- missing key file ---
+    rm -f "${AUTHKEYS_DIR}/alice"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "missing key: exit 1" "1" "${rc}"
+    assert_contains "missing key: FAIL" "key file missing" "${out}"
+
+    # Restore key file
+    printf '%s\n' "${TEST_KEY_ED}" > "${AUTHKEYS_DIR}/alice"
+
+    # --- empty key file ---
+    : > "${AUTHKEYS_DIR}/alice"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "empty key: exit 1" "1" "${rc}"
+    assert_contains "empty key: FAIL" "key file is empty" "${out}"
+
+    # Restore key file
+    printf '%s\n' "${TEST_KEY_ED}" > "${AUTHKEYS_DIR}/alice"
+
+    # --- unmounted ---
+    local mp_alice="${REMOUNT_ROOT}/alice/backups"
+    grep -vxF "${mp_alice}" "${FAKE_MOUNTS}" > "${FAKE_MOUNTS}.tmp" || true
+    mv "${FAKE_MOUNTS}.tmp" "${FAKE_MOUNTS}"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "unmounted: exit 1" "1" "${rc}"
+    assert_contains "unmounted: FAIL" "mount is NOT active" "${out}"
+
+    # Restore mount
+    printf '%s\n' "${mp_alice}" >> "${FAKE_MOUNTS}"
+
+    # --- missing source dir ---
+    rmdir "${SRC_A}"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "missing source dir: exit 1" "1" "${rc}"
+    assert_contains "missing source dir: FAIL" "source directory missing" "${out}"
+
+    # Restore source dir
+    mkdir -p "${SRC_A}"
+
+    # --- bad permissions via fake stat registry ---
+    local chroot_alice="${REMOUNT_ROOT}/alice"
+    printf '%s nobody:nogroup 777\n' "${chroot_alice}" > "${FAKE_STAT_REGISTRY}"
+
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "bad perms: exit 1" "1" "${rc}"
+    assert_contains "bad perms: wrong owner" "nobody:nogroup" "${out}"
+    assert_contains "bad perms: wrong mode" "777" "${out}"
+
+    # Clear registry
+    : > "${FAKE_STAT_REGISTRY}"
+
+    # --- no users ---
+    reset_sshd_cfg
+    reset_service
+    rc=0; out=$(run_sut admin-check-all \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" 2>&1) || rc=$?
+    assert_eq "no users: exit 0" "0" "${rc}"
+    assert_contains "no users: msg" "No managed users" "${out}"
+
+    # Clean up
+    reset_sshd_cfg
+    reset_service
+}
+
 test_help_flag() {
     printf '\n=== help and flag tests ===\n'
 
@@ -1072,11 +1222,11 @@ test_help_flag() {
     assert_contains "no args shows help" "SYNOPSIS" "${out}"
 
     out=$(bash "${SUT}" -i 2>&1 || true)
-    assert_contains "-i shows version" "1.2.0" "${out}"
+    assert_contains "-i shows version" "1.3.0" "${out}"
     assert_contains "-i shows script name" "backup_access" "${out}"
 
     out=$(bash "${SUT}" --info 2>&1 || true)
-    assert_contains "--info shows version" "1.2.0" "${out}"
+    assert_contains "--info shows version" "1.3.0" "${out}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1254,7 @@ main() {
     test_sshd_validation_failure
     test_conflicting_subsystem_preflight
     test_admin_recreate_mounts
+    test_admin_check_all
 
     printf '\n=== Results ===\n'
     printf 'PASS: %d\n' "${PASS}"

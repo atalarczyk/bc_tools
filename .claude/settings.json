@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash test_backup_access.sh --verbose)",
+      "Bash(bash test_backup_access.sh)"
+    ]
+  }
+}
