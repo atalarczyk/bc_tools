@@ -9,13 +9,14 @@
 #   - a read-only bind mount of a backup source directory to REMOUNT_ROOT/USERNAME/backups/
 #   - a public-key file under AUTHORIZED_KEYS_DIR/USERNAME
 #   - one Match User block in sshd_config (guarded by script markers)
-#   - one block in /etc/fstab (guarded by script markers)
+#   - one block in a systemd oneshot service (guarded by script markers)
 
 set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+readonly VERSION="1.2.0"
 readonly SCRIPT_NAME="backup_access"
 readonly MARKER_BEGIN="# BEGIN ${SCRIPT_NAME}"
 readonly MARKER_END="# END ${SCRIPT_NAME}"
@@ -23,6 +24,8 @@ readonly MARKER_END="# END ${SCRIPT_NAME}"
 readonly DEFAULT_REMOUNT_ROOT="/srv/sftp"
 readonly DEFAULT_SSH_CONFIG="/etc/ssh/sshd_config"
 readonly DEFAULT_AUTHORIZED_KEYS_DIR="/etc/ssh/authorized_keys"
+readonly SYSTEMD_SERVICE_NAME="backup-access-mounts"
+readonly DEFAULT_SYSTEMD_SERVICE_FILE="/etc/systemd/system/${SYSTEMD_SERVICE_NAME}.service"
 
 readonly LOCK_FILE="/var/lock/${SCRIPT_NAME}.lock"
 
@@ -39,8 +42,9 @@ readonly VALID_KEY_TYPES=(
 # ---------------------------------------------------------------------------
 # Environment variable overrides (for testing only – not exposed as CLI flags)
 # ---------------------------------------------------------------------------
-FSTAB_FILE="${FSTAB_FILE:-/etc/fstab}"
+SYSTEMD_SERVICE_FILE="${SYSTEMD_SERVICE_FILE:-${DEFAULT_SYSTEMD_SERVICE_FILE}}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-/bin/systemctl}"
 ADDUSER_BIN="${ADDUSER_BIN:-/usr/sbin/adduser}"
 USERDEL_BIN="${USERDEL_BIN:-/usr/sbin/userdel}"
 MOUNT_BIN="${MOUNT_BIN:-/bin/mount}"
@@ -139,6 +143,7 @@ cmd_findmnt()    { "${FINDMNT_BIN}" "$@"; }
 cmd_adduser()    { "${ADDUSER_BIN}" "$@"; }
 cmd_userdel()    { "${USERDEL_BIN}" "$@"; }
 cmd_sshd_test()  { "${SSHD_BIN}" "$@"; }
+cmd_systemctl()  { "${SYSTEMCTL_BIN}" "$@"; }
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -250,10 +255,10 @@ get_managed_users_from_file() {
         || true
 }
 
-# Print the source directory recorded in the managed fstab block for USERNAME.
-get_fstab_source_dir() {
+# Print the source directory recorded in the managed service block for USERNAME.
+get_service_source_dir() {
     local username="$1"
-    [[ -f "${FSTAB_FILE}" ]] || return 0
+    [[ -f "${SYSTEMD_SERVICE_FILE}" ]] || return 0
     local begin="${MARKER_BEGIN} ${username}"
     local end="${MARKER_END} ${username}"
     local in_block=0
@@ -263,14 +268,13 @@ get_fstab_source_dir() {
         if [[ "${line}" == "${end}" ]]; then
             break; fi
         if [[ "${in_block}" -eq 1 ]]; then
-            local src
-            src=$(printf '%s' "${line}" | awk '{print $1}')
-            if [[ -n "${src}" && "${src}" != "#" ]]; then
-                printf '%s' "${src}"
+            # Parse: ExecStart=/bin/mount --bind SOURCE MOUNTPOINT
+            if [[ "${line}" =~ ExecStart=.*\ --bind\ (.+)\ (.+) ]]; then
+                printf '%s' "${BASH_REMATCH[1]}"
                 return
             fi
         fi
-    done < "${FSTAB_FILE}"
+    done < "${SYSTEMD_SERVICE_FILE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -293,14 +297,27 @@ build_ssh_block() {
     printf '%s %s\n' "${MARKER_END}" "${username}"
 }
 
-build_fstab_block() {
+build_service_header() {
+    cat <<EOF
+[Unit]
+Description=Backup access read-only bind mounts (managed by ${SCRIPT_NAME})
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EOF
+}
+
+build_service_user_block() {
     local username="$1"
     local source_dir="$2"
     local remount_root="$3"
     local mp="${remount_root}/${username}/backups"
     printf '%s %s\n' "${MARKER_BEGIN}" "${username}"
-    printf '%s  %s  none  bind              0 0\n' "${source_dir}" "${mp}"
-    printf '%s  %s  none  bind,remount,ro   0 0\n' "${source_dir}" "${mp}"
+    printf 'ExecStart=/bin/mount --bind %s %s\n' "${source_dir}" "${mp}"
+    printf 'ExecStart=/bin/mount -o remount,ro,bind %s\n' "${mp}"
+    printf 'ExecStop=-/bin/umount %s\n' "${mp}"
     printf '%s %s\n' "${MARKER_END}" "${username}"
 }
 
@@ -475,49 +492,98 @@ remove_ssh_block_for_user() {
 }
 
 # ---------------------------------------------------------------------------
-# fstab management
+# Systemd service management
 # ---------------------------------------------------------------------------
 
-# Add or update the managed fstab block for USERNAME with SOURCE_DIR.
-update_fstab_for_user() {
+# Add or update the managed block for USERNAME in the systemd service.
+# Creates the service file if it does not exist.
+update_systemd_service_for_user() {
     local username="$1"
     local source_dir="$2"
-    local config="${FSTAB_FILE}"
-    [[ -f "${config}" ]] || die "fstab not found: ${config}"
+    local user_block
+    user_block=$(build_service_user_block "${username}" "${source_dir}" "${OPT_REMOUNT_ROOT}")
 
-    local new_block
-    new_block=$(build_fstab_block "${username}" "${source_dir}" "${OPT_REMOUNT_ROOT}")
+    if [[ ! -f "${SYSTEMD_SERVICE_FILE}" ]]; then
+        # Create new service file
+        local tmp
+        tmp=$(make_temp)
+        {
+            build_service_header
+            printf '%s\n' "${user_block}"
+            printf '\n[Install]\nWantedBy=multi-user.target\n'
+        } > "${tmp}"
+        cp "${tmp}" "${SYSTEMD_SERVICE_FILE}"
+        cmd_chown root:root "${SYSTEMD_SERVICE_FILE}"
+        cmd_chmod 644 "${SYSTEMD_SERVICE_FILE}"
+        cmd_systemctl daemon-reload
+        cmd_systemctl enable "${SYSTEMD_SERVICE_NAME}.service"
+        log_info "Created and enabled systemd service: ${SYSTEMD_SERVICE_FILE}"
+        return
+    fi
+
+    # Update existing service: remove old block for this user (if any),
+    # then insert new block before the [Install] section.
+    local cleaned
+    cleaned=$(make_temp)
+    if has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}"; then
+        remove_block_from_stream "${username}" < "${SYSTEMD_SERVICE_FILE}" > "${cleaned}"
+    else
+        cp "${SYSTEMD_SERVICE_FILE}" "${cleaned}"
+    fi
 
     local tmp
     tmp=$(make_temp)
-
-    if has_managed_block "${config}" "${username}"; then
-        remove_block_from_stream "${username}" < "${config}" > "${tmp}"
-    else
-        cp "${config}" "${tmp}"
+    local install_found=0
+    while IFS= read -r line; do
+        if [[ "${line}" == "[Install]" && "${install_found}" -eq 0 ]]; then
+            install_found=1
+            printf '%s\n\n' "${user_block}" >> "${tmp}"
+        fi
+        printf '%s\n' "${line}" >> "${tmp}"
+    done < "${cleaned}"
+    if [[ "${install_found}" -eq 0 ]]; then
+        printf '%s\n' "${user_block}" >> "${tmp}"
     fi
-    printf '\n%s\n' "${new_block}" >> "${tmp}"
 
-    atomic_replace_file "${config}" "${tmp}" >/dev/null
-    log_info "fstab updated for '${username}' (source: ${source_dir})"
+    atomic_replace_file "${SYSTEMD_SERVICE_FILE}" "${tmp}" >/dev/null
+    cmd_systemctl daemon-reload
+    log_info "Systemd service updated for '${username}' (source: ${source_dir})"
 }
 
-# Remove the managed fstab block for USERNAME.
-remove_fstab_for_user() {
+# Remove the managed block for USERNAME from the systemd service.
+# If no managed blocks remain, disables and removes the service file.
+remove_systemd_service_for_user() {
     local username="$1"
-    local config="${FSTAB_FILE}"
 
-    if ! has_managed_block "${config}" "${username}"; then
-        log_warn "No managed fstab block found for '${username}' in ${config}"
+    if [[ ! -f "${SYSTEMD_SERVICE_FILE}" ]]; then
+        log_warn "Systemd service file not found: ${SYSTEMD_SERVICE_FILE}"
+        return 0
+    fi
+
+    if ! has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}"; then
+        log_warn "No managed block found for '${username}' in ${SYSTEMD_SERVICE_FILE}"
         return 0
     fi
 
     local tmp
     tmp=$(make_temp)
-    remove_block_from_stream "${username}" < "${config}" > "${tmp}"
+    remove_block_from_stream "${username}" < "${SYSTEMD_SERVICE_FILE}" > "${tmp}"
 
-    atomic_replace_file "${config}" "${tmp}" >/dev/null
-    log_info "Managed fstab block removed for '${username}'"
+    # Check if any managed blocks remain
+    local remaining
+    remaining=$(grep -c "^${MARKER_BEGIN} " "${tmp}" 2>/dev/null) || remaining=0
+
+    if [[ "${remaining}" -eq 0 ]]; then
+        # No more users: disable and remove the service
+        cmd_systemctl disable "${SYSTEMD_SERVICE_NAME}.service" 2>/dev/null || true
+        rm -f "${SYSTEMD_SERVICE_FILE}"
+        cmd_systemctl daemon-reload
+        log_info "Removed systemd service (no managed users remain): ${SYSTEMD_SERVICE_FILE}"
+    else
+        atomic_replace_file "${SYSTEMD_SERVICE_FILE}" "${tmp}" >/dev/null
+        cmd_systemctl daemon-reload
+        log_info "Managed block removed for '${username}' from systemd service"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -702,12 +768,12 @@ delete_os_user() {
 # COMMAND: list
 # ---------------------------------------------------------------------------
 cmd_list() {
-    local ssh_users fstab_users all_users
+    local ssh_users service_users all_users
 
     ssh_users=$(get_managed_users_from_file "${OPT_SSH_CONFIG}")
-    fstab_users=$(get_managed_users_from_file "${FSTAB_FILE}")
+    service_users=$(get_managed_users_from_file "${SYSTEMD_SERVICE_FILE}")
 
-    all_users=$(printf '%s\n%s\n' "${ssh_users}" "${fstab_users}" \
+    all_users=$(printf '%s\n%s\n' "${ssh_users}" "${service_users}" \
         | sort -u | grep -v '^$') || true
 
     if [[ -z "${all_users}" ]]; then
@@ -726,7 +792,7 @@ cmd_list() {
         [[ -z "${username}" ]] && continue
 
         local key dir
-        dir=$(get_fstab_source_dir "${username}")
+        dir=$(get_service_source_dir "${username}")
 
         if [[ "${OPT_MINIMAL_LIST}" -eq 1 ]]; then
             printf '%s\t%s\n' \
@@ -741,22 +807,22 @@ cmd_list() {
         fi
 
         if [[ "${OPT_VERBOSE}" -eq 1 ]]; then
-            local sshd_count fstab_count
+            local sshd_count service_count
             sshd_count=$(count_managed_blocks "${OPT_SSH_CONFIG}" "${username}")
-            fstab_count=$(count_managed_blocks "${FSTAB_FILE}" "${username}")
+            service_count=$(count_managed_blocks "${SYSTEMD_SERVICE_FILE}" "${username}")
 
             user_exists "${username}" \
                 || log_warn "  [INCONSISTENCY] OS user '${username}' missing"
             [[ -f "${OPT_AUTHORIZED_KEYS_DIR}/${username}" ]] \
                 || log_warn "  [INCONSISTENCY] Key file missing: ${OPT_AUTHORIZED_KEYS_DIR}/${username}"
-            has_managed_block "${FSTAB_FILE}" "${username}" \
-                || log_warn "  [INCONSISTENCY] No managed fstab block for '${username}'"
+            has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}" \
+                || log_warn "  [INCONSISTENCY] No managed service block for '${username}'"
             has_managed_block "${OPT_SSH_CONFIG}" "${username}" \
                 || log_warn "  [INCONSISTENCY] No managed SSH block for '${username}'"
             [[ "${sshd_count}" -le 1 ]] \
                 || log_warn "  [INCONSISTENCY] Duplicate managed SSH blocks (${sshd_count}) for '${username}'"
-            [[ "${fstab_count}" -le 1 ]] \
-                || log_warn "  [INCONSISTENCY] Duplicate managed fstab blocks (${fstab_count}) for '${username}'"
+            [[ "${service_count}" -le 1 ]] \
+                || log_warn "  [INCONSISTENCY] Duplicate managed service blocks (${service_count}) for '${username}'"
             local mp="${OPT_REMOUNT_ROOT}/${username}/backups"
             if [[ ! -d "${mp}" ]]; then
                 log_warn "  [INCONSISTENCY] Mountpoint directory missing: ${mp}"
@@ -792,7 +858,7 @@ cmd_add() {
     if has_managed_block "${OPT_SSH_CONFIG}" "${username}"; then
         local existing_key existing_dir
         existing_key=$(read_authorized_key "${username}")
-        existing_dir=$(get_fstab_source_dir "${username}")
+        existing_dir=$(get_service_source_dir "${username}")
 
         if [[ "${existing_key}" == "${OPT_PUBLIC_KEY}" ]] \
             && [[ "${existing_dir}" == "${source_dir}" ]] \
@@ -806,7 +872,7 @@ cmd_add() {
 
     # Partial state guard
     if user_exists "${username}" \
-        || has_managed_block "${FSTAB_FILE}" "${username}" \
+        || has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}" \
         || [[ -f "${key_file}" ]]; then
         die "User '${username}' has partial managed state (OS user or fstab block or key file exists). Use 'delete' to clean up first, or 'modify' to update."
     fi
@@ -820,7 +886,7 @@ cmd_add() {
         log_info "  1. Create system user: ${username}"
         log_info "  2. Create chroot tree: ${mp}"
         log_info "  3. Write authorized key: ${key_file}"
-        log_info "  4. Add fstab block: ${source_dir} -> ${mp}"
+        log_info "  4. Add systemd service block: ${source_dir} -> ${mp}"
         log_info "  5. Bind mount ${source_dir} -> ${mp} (read-only)"
         log_info "  6. Add sshd_config Match block + ensure global Subsystem sftp internal-sftp"
         log_info "  Next step: systemctl reload ssh"
@@ -832,7 +898,7 @@ cmd_add() {
     create_os_user "${username}"
     create_chroot_tree "${username}"
     write_authorized_key "${username}" "${OPT_PUBLIC_KEY}"
-    update_fstab_for_user "${username}" "${source_dir}"
+    update_systemd_service_for_user "${username}" "${source_dir}"
     mount_user_dir "${username}" "${source_dir}"
     update_sshd_config_for_user "${username}"
 
@@ -863,7 +929,7 @@ cmd_modify() {
         [[ -n "${OPT_PUBLIC_KEY}" ]] && log_info "  - Update authorized key"
         if [[ -n "${OPT_DIRECTORY}" ]]; then
             log_info "  - Unmount old mountpoint if mounted"
-            log_info "  - Update fstab block to: ${OPT_DIRECTORY}"
+            log_info "  - Update systemd service block to: ${OPT_DIRECTORY}"
             log_info "  - Bind mount ${OPT_DIRECTORY} -> ${OPT_REMOUNT_ROOT}/${username}/backups (read-only)"
         fi
         return 0
@@ -880,7 +946,7 @@ cmd_modify() {
         validate_absolute_path "${OPT_DIRECTORY}"    "--directory"
         validate_directory_exists "${OPT_DIRECTORY}" "--directory"
         unmount_user_dir "${username}"
-        update_fstab_for_user "${username}" "${OPT_DIRECTORY}"
+        update_systemd_service_for_user "${username}" "${OPT_DIRECTORY}"
         mount_user_dir "${username}" "${OPT_DIRECTORY}"
     fi
 
@@ -896,19 +962,19 @@ cmd_delete() {
     validate_username "${OPT_USER}"
 
     local username="${OPT_USER}"
-    local has_ssh=0 has_fstab=0
+    local has_ssh=0 has_service=0
     has_managed_block "${OPT_SSH_CONFIG}" "${username}" && has_ssh=1 || true
-    has_managed_block "${FSTAB_FILE}"     "${username}" && has_fstab=1 || true
+    has_managed_block "${SYSTEMD_SERVICE_FILE}" "${username}" && has_service=1 || true
 
-    if [[ "${has_ssh}" -eq 0 && "${has_fstab}" -eq 0 ]]; then
+    if [[ "${has_ssh}" -eq 0 && "${has_service}" -eq 0 ]]; then
         log_warn "No managed state found for '${username}'; nothing to delete"
         return 0
     fi
 
     if [[ "${OPT_DRY_RUN}" -eq 1 ]]; then
         log_info "[DRY-RUN] Planned actions for 'delete ${username}':"
-        [[ "${has_ssh}" -eq 1 ]]   && log_info "  - Remove managed SSH block from ${OPT_SSH_CONFIG}"
-        [[ "${has_fstab}" -eq 1 ]] && log_info "  - Remove managed fstab block from ${FSTAB_FILE}"
+        [[ "${has_ssh}" -eq 1 ]]     && log_info "  - Remove managed SSH block from ${OPT_SSH_CONFIG}"
+        [[ "${has_service}" -eq 1 ]] && log_info "  - Remove managed service block from ${SYSTEMD_SERVICE_FILE}"
         log_info "  - Unmount ${OPT_REMOUNT_ROOT}/${username}/backups if mounted"
         log_info "  - Remove authorized key: ${OPT_AUTHORIZED_KEYS_DIR}/${username}"
         log_info "  - Remove OS user: ${username}"
@@ -920,11 +986,11 @@ cmd_delete() {
     acquire_lock
 
     # 1. Remove SSH block first to close the access path
-    [[ "${has_ssh}" -eq 1 ]]   && remove_ssh_block_for_user "${username}"
-    # 2. Unmount before touching fstab
+    [[ "${has_ssh}" -eq 1 ]]     && remove_ssh_block_for_user "${username}"
+    # 2. Unmount before touching service
     unmount_user_dir "${username}"
-    # 3. Remove fstab block
-    [[ "${has_fstab}" -eq 1 ]] && remove_fstab_for_user "${username}"
+    # 3. Remove systemd service block
+    [[ "${has_service}" -eq 1 ]] && remove_systemd_service_for_user "${username}"
     # 4. Remove key file
     remove_authorized_key "${username}"
     # 5. Remove OS user
@@ -934,6 +1000,85 @@ cmd_delete() {
 
     log_info "User '${username}' deleted successfully."
     log_info "Next step: systemctl reload ssh"
+}
+
+# ---------------------------------------------------------------------------
+# COMMAND: admin-recreate-mounts
+# ---------------------------------------------------------------------------
+cmd_admin_recreate_mounts() {
+    validate_absolute_path "${OPT_REMOUNT_ROOT}" "--remount-root"
+    validate_absolute_path "${OPT_SSH_CONFIG}"   "--ssh-config"
+
+    local ssh_users service_users
+    ssh_users=$(get_managed_users_from_file "${OPT_SSH_CONFIG}")
+    service_users=$(get_managed_users_from_file "${SYSTEMD_SERVICE_FILE}")
+
+    local changed=0
+
+    # 1. Remove orphaned service entries (in service, not in sshd_config)
+    if [[ -n "${service_users}" ]]; then
+        local svc_user
+        while IFS= read -r svc_user; do
+            [[ -z "${svc_user}" ]] && continue
+            if [[ -z "${ssh_users}" ]] \
+                || ! printf '%s\n' "${ssh_users}" | grep -qxF "${svc_user}"; then
+                log_info "Orphaned service entry: '${svc_user}'"
+                local mp="${OPT_REMOUNT_ROOT}/${svc_user}/backups"
+                if [[ "${OPT_DRY_RUN}" -eq 1 ]]; then
+                    is_mounted "${mp}" \
+                        && log_info "[DRY-RUN] Would unmount ${mp}"
+                    log_info "[DRY-RUN] Would remove service block for '${svc_user}'"
+                else
+                    unmount_user_dir "${svc_user}"
+                    remove_systemd_service_for_user "${svc_user}"
+                fi
+                changed=1
+            fi
+        done <<< "${service_users}"
+    fi
+
+    # 2. Process users that should have mounts (in sshd_config)
+    if [[ -n "${ssh_users}" ]]; then
+        local ssh_user
+        while IFS= read -r ssh_user; do
+            [[ -z "${ssh_user}" ]] && continue
+            local mp="${OPT_REMOUNT_ROOT}/${ssh_user}/backups"
+
+            if has_managed_block "${SYSTEMD_SERVICE_FILE}" "${ssh_user}"; then
+                # Service entry exists: ensure mount is active
+                if ! is_mounted "${mp}"; then
+                    local source_dir
+                    source_dir=$(get_service_source_dir "${ssh_user}")
+                    if [[ -z "${source_dir}" ]]; then
+                        log_warn "Service entry for '${ssh_user}' has no source directory; skipping"
+                        continue
+                    fi
+                    if [[ ! -d "${source_dir}" ]]; then
+                        log_warn "Source directory '${source_dir}' for '${ssh_user}' does not exist; skipping"
+                        continue
+                    fi
+                    if [[ ! -d "${mp}" ]]; then
+                        log_warn "Mountpoint '${mp}' for '${ssh_user}' does not exist; skipping"
+                        continue
+                    fi
+                    if [[ "${OPT_DRY_RUN}" -eq 1 ]]; then
+                        log_info "[DRY-RUN] Would mount ${source_dir} -> ${mp} (read-only)"
+                    else
+                        mount_user_dir "${ssh_user}" "${source_dir}"
+                    fi
+                    changed=1
+                fi
+            else
+                # No service entry: cannot determine source directory
+                log_warn "No service entry for managed user '${ssh_user}'; use 'modify -d DIR -u ${ssh_user}' to set the source directory"
+                changed=1
+            fi
+        done <<< "${ssh_users}"
+    fi
+
+    if [[ "${changed}" -eq 0 ]]; then
+        log_info "No changes needed: all mounts are consistent"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -960,7 +1105,11 @@ COMMANDS
     add           Add a new managed SFTP user
     modify        Update an existing managed user (key and/or directory)
     delete        Remove a managed user and all associated state
+    admin-recreate-mounts
+                  Reconcile systemd mount service with managed accounts:
+                  mount unmounted entries, remove orphaned entries
     -h, --help    Show this help message (may appear as first argument only)
+    -i, --info    Show version and exit
 
 OPTIONS
     -h, --help                Show this help message
@@ -979,8 +1128,8 @@ NOTES
     - add, modify, and delete require root privileges.
     - Only configuration blocks marked with
         # BEGIN backup_access USERNAME … # END backup_access USERNAME
-      are created or modified.  All other content in sshd_config and fstab is
-      left untouched.
+      are created or modified.  All other content in sshd_config and the
+      systemd service file is left untouched.
     - The global line "Subsystem sftp internal-sftp" is added to sshd_config
       if absent.  If a conflicting "Subsystem sftp <other>" line is found, the
       script aborts rather than silently rewriting it.
@@ -1031,8 +1180,9 @@ parse_args() {
     # First argument must be a command or help flag
     case "$1" in
         -h|--help)            print_help; exit 0 ;;
-        list|add|modify|delete) COMMAND="$1"; shift ;;
-        *) die "First argument must be a command: list add modify delete -h --help  (got: '$1')" ;;
+        -i|--info)            printf '%s %s\n' "${SCRIPT_NAME}" "${VERSION}"; exit 0 ;;
+        list|add|modify|delete|admin-recreate-mounts) COMMAND="$1"; shift ;;
+        *) die "First argument must be a command: list add modify delete admin-recreate-mounts -h --help -i --info  (got: '$1')" ;;
     esac
 
     # Parse remaining options
@@ -1081,6 +1231,7 @@ main() {
         add)    require_root; cmd_add ;;
         modify) require_root; cmd_modify ;;
         delete) require_root; cmd_delete ;;
+        admin-recreate-mounts) require_root; cmd_admin_recreate_mounts ;;
     esac
 }
 

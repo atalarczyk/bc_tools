@@ -30,7 +30,7 @@ FAKE_BIN=""
 FAKE_MOUNTS=""    # file tracking fake-mounted paths
 FAKE_LOG=""       # log of stub invocations
 SSHD_CFG=""
-FSTAB=""
+SYSTEMD_SERVICE=""
 AUTHKEYS_DIR=""
 REMOUNT_ROOT=""
 BACKUP_SRC=""
@@ -131,7 +131,7 @@ setup_fixtures() {
     FAKE_MOUNTS="${TMPBASE}/mounts"
     FAKE_LOG="${TMPBASE}/cmd.log"
     SSHD_CFG="${TMPBASE}/sshd_config"
-    FSTAB="${TMPBASE}/fstab"
+    SYSTEMD_SERVICE="${TMPBASE}/backup-access-mounts.service"
     AUTHKEYS_DIR="${TMPBASE}/authorized_keys"
     REMOUNT_ROOT="${TMPBASE}/sftp"
     BACKUP_SRC="${TMPBASE}/backup_src"
@@ -139,7 +139,6 @@ setup_fixtures() {
     mkdir -p "${FAKE_BIN}" "${AUTHKEYS_DIR}" "${REMOUNT_ROOT}" "${BACKUP_SRC}"
     touch "${FAKE_MOUNTS}" "${FAKE_LOG}"
     printf '%s' "${SSHD_CFG_MINIMAL}" > "${SSHD_CFG}"
-    printf '# fstab fixture\n' > "${FSTAB}"
 
     _write_fake_commands
 }
@@ -234,6 +233,11 @@ STUB
 printf 'install %s\n' "\$*" >> "${FAKE_LOG}"
 STUB
 
+    cat > "${FAKE_BIN}/systemctl" <<STUB
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "\$*" >> "${FAKE_LOG}"
+STUB
+
     chmod +x "${FAKE_BIN}"/*
 }
 
@@ -263,8 +267,9 @@ STUB
 
 # Run the SUT with all environment overrides pointing at test fixtures.
 run_sut() {
-    FSTAB_FILE="${FSTAB}" \
+    SYSTEMD_SERVICE_FILE="${SYSTEMD_SERVICE}" \
     SSHD_BIN="${FAKE_BIN}/sshd" \
+    SYSTEMCTL_BIN="${FAKE_BIN}/systemctl" \
     ADDUSER_BIN="${FAKE_BIN}/adduser" \
     USERDEL_BIN="${FAKE_BIN}/userdel" \
     MOUNT_BIN="${FAKE_BIN}/mount" \
@@ -296,9 +301,9 @@ reset_sshd_cfg() {
     printf '%s' "${SSHD_CFG_MINIMAL}" > "${SSHD_CFG}"
 }
 
-# Convenience: reset fstab fixture.
-reset_fstab() {
-    printf '# fstab fixture\n' > "${FSTAB}"
+# Convenience: reset systemd service fixture (remove the file).
+reset_service() {
+    rm -f "${SYSTEMD_SERVICE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -425,7 +430,7 @@ test_sshd_config_block() {
     printf '\n=== sshd_config managed block tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     run_sut add \
         -r "${REMOUNT_ROOT}" \
@@ -473,50 +478,59 @@ test_sshd_config_block() {
         "Port 22" "${SSHD_CFG}"
 }
 
-test_fstab_block() {
-    printf '\n=== fstab managed block tests ===\n'
+test_systemd_service_block() {
+    printf '\n=== systemd service managed block tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     run_sut add \
         -r "${REMOUNT_ROOT}" \
         -s "${SSHD_CFG}" \
         -a "${AUTHKEYS_DIR}" \
-        -u fstabtest \
+        -u svctest \
         -k "${TEST_KEY_ED}" \
         -d "${BACKUP_SRC}" >/dev/null 2>&1
 
-    local mp="${REMOUNT_ROOT}/fstabtest/backups"
-    assert_file_contains "fstab BEGIN marker" \
-        "# BEGIN backup_access fstabtest" "${FSTAB}"
-    assert_file_contains "fstab END marker" \
-        "# END backup_access fstabtest" "${FSTAB}"
-    assert_file_contains "fstab bind line" \
-        "${BACKUP_SRC}  ${mp}  none  bind" "${FSTAB}"
-    assert_file_contains "fstab remount,ro line" \
-        "${BACKUP_SRC}  ${mp}  none  bind,remount,ro" "${FSTAB}"
-    assert_file_contains "original fstab comment preserved" \
-        "# fstab fixture" "${FSTAB}"
+    local mp="${REMOUNT_ROOT}/svctest/backups"
+    assert_file_exists "service file created" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service BEGIN marker" \
+        "# BEGIN backup_access svctest" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service END marker" \
+        "# END backup_access svctest" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service bind mount line" \
+        "ExecStart=/bin/mount --bind ${BACKUP_SRC} ${mp}" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service remount ro line" \
+        "ExecStart=/bin/mount -o remount,ro,bind ${mp}" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service umount line" \
+        "ExecStop=-/bin/umount ${mp}" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service Unit section" \
+        "[Unit]" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service Type=oneshot" \
+        "Type=oneshot" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service RemainAfterExit" \
+        "RemainAfterExit=yes" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service Install section" \
+        "[Install]" "${SYSTEMD_SERVICE}"
+    assert_file_contains "service WantedBy" \
+        "WantedBy=multi-user.target" "${SYSTEMD_SERVICE}"
 
-    # Delete removes the block
+    # Delete removes the block; with no users left, file is removed
     run_sut delete \
         -r "${REMOUNT_ROOT}" \
         -s "${SSHD_CFG}" \
         -a "${AUTHKEYS_DIR}" \
-        -u fstabtest >/dev/null 2>&1
+        -u svctest >/dev/null 2>&1
 
-    assert_file_not_contains "fstab block removed" \
-        "# BEGIN backup_access fstabtest" "${FSTAB}"
-    assert_file_contains "original fstab comment still present" \
-        "# fstab fixture" "${FSTAB}"
+    assert_file_absent "service file removed when last user deleted" \
+        "${SYSTEMD_SERVICE}"
 }
 
 test_add_idempotency() {
     printf '\n=== add idempotency tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     # First add
     run_sut add \
@@ -529,8 +543,8 @@ test_add_idempotency() {
 
     local sshd_before
     sshd_before=$(cat "${SSHD_CFG}")
-    local fstab_before
-    fstab_before=$(cat "${FSTAB}")
+    local service_before
+    service_before=$(cat "${SYSTEMD_SERVICE}")
 
     # Second add with identical parameters: should say "no changes needed"
     local out
@@ -543,7 +557,7 @@ test_add_idempotency() {
         -d "${BACKUP_SRC}")
     assert_contains "idempotent add reports no changes" "No changes needed" "${out}"
     assert_eq "sshd_config unchanged after idempotent add" "${sshd_before}" "$(cat "${SSHD_CFG}")"
-    assert_eq "fstab unchanged after idempotent add" "${fstab_before}" "$(cat "${FSTAB}")"
+    assert_eq "service unchanged after idempotent add" "${service_before}" "$(cat "${SYSTEMD_SERVICE}")"
 
     # Second add with different key should fail with "use modify"
     out=$(run_sut_output add \
@@ -567,7 +581,7 @@ test_modify() {
     printf '\n=== modify tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     run_sut add \
         -r "${REMOUNT_ROOT}" \
@@ -593,16 +607,15 @@ test_modify() {
     assert_eq "modify key: new key written" "${TEST_KEY_ED2}" "${new_key}"
     # SSH block should be unchanged
     assert_eq "modify key only: sshd_config block unchanged" "${sshd_before}" "$(cat "${SSHD_CFG}")"
-    # fstab source should still be old
-    local dir
-    dir=$(grep -m1 "^${BACKUP_SRC}" "${FSTAB}" | awk '{print $1}')
-    assert_eq "modify key only: fstab source unchanged" "${BACKUP_SRC}" "${dir}"
+    # service source should still be old
+    assert_file_contains "modify key only: service source unchanged" \
+        "${BACKUP_SRC}" "${SYSTEMD_SERVICE}"
 
     # --- modify directory only ---
     local BACKUP_SRC2="${TMPBASE}/backup_src2"
     mkdir -p "${BACKUP_SRC2}"
-    local fstab_before
-    fstab_before=$(cat "${FSTAB}")
+    local service_before
+    service_before=$(cat "${SYSTEMD_SERVICE}")
 
     run_sut modify \
         -r "${REMOUNT_ROOT}" \
@@ -611,12 +624,12 @@ test_modify() {
         -u moduser \
         -d "${BACKUP_SRC2}" >/dev/null 2>&1
 
-    assert_file_contains "modify dir: new source in fstab block" \
-        "${BACKUP_SRC2}" "${FSTAB}"
-    assert_file_not_contains "modify dir: old source absent from fstab" \
-        "${BACKUP_SRC}  " "${FSTAB}"
+    assert_file_contains "modify dir: new source in service block" \
+        "${BACKUP_SRC2}" "${SYSTEMD_SERVICE}"
+    assert_file_not_contains "modify dir: old source absent from service" \
+        "--bind ${BACKUP_SRC} " "${SYSTEMD_SERVICE}"
     assert_file_contains "modify dir: managed block still present" \
-        "# BEGIN backup_access moduser" "${FSTAB}"
+        "# BEGIN backup_access moduser" "${SYSTEMD_SERVICE}"
     # sshd_config block must not have changed
     assert_eq "modify dir only: sshd_config unchanged" "${sshd_before}" "$(cat "${SSHD_CFG}")"
     # key must not have changed
@@ -645,7 +658,7 @@ test_delete() {
     printf '\n=== delete tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     run_sut add \
         -r "${REMOUNT_ROOT}" \
@@ -658,8 +671,8 @@ test_delete() {
     # Verify state was created
     assert_file_contains "add: SSH block present before delete" \
         "# BEGIN backup_access deluser" "${SSHD_CFG}"
-    assert_file_contains "add: fstab block present before delete" \
-        "# BEGIN backup_access deluser" "${FSTAB}"
+    assert_file_contains "add: service block present before delete" \
+        "# BEGIN backup_access deluser" "${SYSTEMD_SERVICE}"
     assert_file_exists "add: key file present before delete" \
         "${AUTHKEYS_DIR}/deluser"
 
@@ -671,8 +684,8 @@ test_delete() {
 
     assert_file_not_contains "delete: SSH block removed" \
         "# BEGIN backup_access deluser" "${SSHD_CFG}"
-    assert_file_not_contains "delete: fstab block removed" \
-        "# BEGIN backup_access deluser" "${FSTAB}"
+    assert_file_absent "delete: service file removed (last user)" \
+        "${SYSTEMD_SERVICE}"
     assert_file_absent "delete: key file removed" \
         "${AUTHKEYS_DIR}/deluser"
 
@@ -698,11 +711,10 @@ test_dry_run() {
     printf '\n=== dry-run tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
-    local sshd_snap fstab_snap
+    local sshd_snap
     sshd_snap=$(cat "${SSHD_CFG}")
-    fstab_snap=$(cat "${FSTAB}")
 
     local out
     out=$(run_sut_output add --dry-run \
@@ -715,7 +727,7 @@ test_dry_run() {
 
     assert_contains "dry-run add: output says DRY-RUN" "DRY-RUN" "${out}"
     assert_eq "dry-run add: sshd_config not modified" "${sshd_snap}" "$(cat "${SSHD_CFG}")"
-    assert_eq "dry-run add: fstab not modified" "${fstab_snap}" "$(cat "${FSTAB}")"
+    assert_file_absent "dry-run add: no service file created" "${SYSTEMD_SERVICE}"
     assert_file_absent "dry-run add: no key file created" "${AUTHKEYS_DIR}/dryuser"
 
     # Add for real, then dry-run delete
@@ -728,7 +740,8 @@ test_dry_run() {
         -d "${BACKUP_SRC}" >/dev/null 2>&1
 
     sshd_snap=$(cat "${SSHD_CFG}")
-    fstab_snap=$(cat "${FSTAB}")
+    local service_snap
+    service_snap=$(cat "${SYSTEMD_SERVICE}")
 
     out=$(run_sut_output delete --dry-run \
         -r "${REMOUNT_ROOT}" \
@@ -738,7 +751,7 @@ test_dry_run() {
 
     assert_contains "dry-run delete: output says DRY-RUN" "DRY-RUN" "${out}"
     assert_eq "dry-run delete: sshd_config not modified" "${sshd_snap}" "$(cat "${SSHD_CFG}")"
-    assert_eq "dry-run delete: fstab not modified" "${fstab_snap}" "$(cat "${FSTAB}")"
+    assert_eq "dry-run delete: service not modified" "${service_snap}" "$(cat "${SYSTEMD_SERVICE}")"
     assert_file_exists "dry-run delete: key file still present" "${AUTHKEYS_DIR}/dryuser"
 
     # Clean up
@@ -753,7 +766,7 @@ test_list_output() {
     printf '\n=== list output tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     local BACKUP_SRC_B="${TMPBASE}/backup_b"
     local BACKUP_SRC_C="${TMPBASE}/backup_c"
@@ -826,7 +839,7 @@ test_multiple_users_no_interference() {
     printf '\n=== multi-user isolation tests ===\n'
     _write_fake_id
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
     local SRC_A="${TMPBASE}/src_a" SRC_B="${TMPBASE}/src_b"
     mkdir -p "${SRC_A}" "${SRC_B}"
@@ -844,10 +857,10 @@ test_multiple_users_no_interference() {
         "# BEGIN backup_access alice" "${SSHD_CFG}"
     assert_file_contains "bob SSH block intact" \
         "# BEGIN backup_access bob" "${SSHD_CFG}"
-    assert_file_not_contains "alice fstab block gone" \
-        "# BEGIN backup_access alice" "${FSTAB}"
-    assert_file_contains "bob fstab block intact" \
-        "# BEGIN backup_access bob" "${FSTAB}"
+    assert_file_not_contains "alice service block gone" \
+        "# BEGIN backup_access alice" "${SYSTEMD_SERVICE}"
+    assert_file_contains "bob service block intact" \
+        "# BEGIN backup_access bob" "${SYSTEMD_SERVICE}"
     assert_file_absent "alice key gone" "${AUTHKEYS_DIR}/alice"
     assert_file_exists "bob key intact" "${AUTHKEYS_DIR}/bob"
 
@@ -859,9 +872,9 @@ test_multiple_users_no_interference() {
 test_list_empty() {
     printf '\n=== list on empty config (regression: grep pipefail) ===\n'
     reset_sshd_cfg
-    reset_fstab
+    reset_service
 
-    # Both config files exist but contain zero managed blocks.
+    # Config files exist but contain zero managed blocks (service file absent).
     # Prior to the fix, grep exiting 1 (no matches) propagated through the
     # pipefail pipeline and triggered the ERR trap at the call site in cmd_list.
     local out rc=0
@@ -902,7 +915,7 @@ test_sshd_validation_failure() {
 test_conflicting_subsystem_preflight() {
     printf '\n=== conflicting Subsystem pre-flight: no side effects ===\n'
     _write_fake_id
-    reset_fstab
+    reset_service
 
     # Simulate sshd_config with a conflicting Subsystem sftp line (the real-world
     # trigger: Ubuntu ships "Subsystem sftp /usr/lib/openssh/sftp-server").
@@ -922,8 +935,8 @@ test_conflicting_subsystem_preflight() {
     assert_contains "preflight: reports conflicting Subsystem" "Conflicting" "${out}"
 
     # Must not have created any side effects before the abort
-    assert_file_not_contains "preflight: no fstab block written" \
-        "# BEGIN backup_access preflightuser" "${FSTAB}"
+    assert_file_absent "preflight: no service file created" \
+        "${SYSTEMD_SERVICE}"
     assert_file_absent "preflight: no key file written" \
         "${AUTHKEYS_DIR}/preflightuser"
     assert_file_not_contains "preflight: no SSH block written" \
@@ -935,6 +948,112 @@ test_conflicting_subsystem_preflight() {
     assert_not_contains "preflight: user not listed" "preflightuser" "${out2}"
 
     reset_sshd_cfg
+}
+
+test_admin_recreate_mounts() {
+    printf '\n=== admin-recreate-mounts tests ===\n'
+    _write_fake_id
+    reset_sshd_cfg
+    reset_service
+
+    local SRC_A="${TMPBASE}/src_a" SRC_B="${TMPBASE}/src_b" SRC_C="${TMPBASE}/src_c"
+    mkdir -p "${SRC_A}" "${SRC_B}" "${SRC_C}"
+
+    # --- Setup: add two users normally ---
+    run_sut add -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" \
+        -u alpha -k "${TEST_KEY_ED}" -d "${SRC_A}" >/dev/null 2>&1
+    run_sut add -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" \
+        -u beta  -k "${TEST_KEY_ED2}" -d "${SRC_B}" >/dev/null 2>&1
+
+    # --- Scenario 1: everything consistent → no changes needed ---
+    local out
+    out=$(run_sut_output admin-recreate-mounts \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}")
+    assert_contains "consistent: no changes needed" "No changes needed" "${out}"
+
+    # --- Scenario 2: unmounted entry → should mount it ---
+    # Simulate alpha's mount being lost (remove from fake mounts tracking)
+    local mp_alpha="${REMOUNT_ROOT}/alpha/backups"
+    grep -vxF "${mp_alpha}" "${FAKE_MOUNTS}" > "${FAKE_MOUNTS}.tmp" || true
+    mv "${FAKE_MOUNTS}.tmp" "${FAKE_MOUNTS}"
+    # Verify it's no longer "mounted"
+    assert_exits_fail "alpha unmounted" \
+        bash -c "grep -qxF '${mp_alpha}' '${FAKE_MOUNTS}'"
+
+    out=$(run_sut_output admin-recreate-mounts \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}")
+    assert_contains "remount: alpha mounted" "Mounted" "${out}"
+    # Verify alpha is now mounted again
+    assert_exits_ok "alpha remounted check" \
+        bash -c "grep -qxF '${mp_alpha}' '${FAKE_MOUNTS}'"
+
+    # --- Scenario 3: orphaned service entry → should remove it ---
+    # Manually inject an orphan entry into the service file (a user not in sshd_config)
+    local orphan_block
+    orphan_block=$(printf '# BEGIN backup_access orphan\nExecStart=/bin/mount --bind %s %s/orphan/backups\nExecStart=/bin/mount -o remount,ro,bind %s/orphan/backups\nExecStop=-/bin/umount %s/orphan/backups\n# END backup_access orphan' \
+        "${SRC_C}" "${REMOUNT_ROOT}" "${REMOUNT_ROOT}" "${REMOUNT_ROOT}")
+    # Insert before [Install] in the service file
+    local tmp_svc
+    tmp_svc=$(mktemp)
+    while IFS= read -r line; do
+        if [[ "${line}" == "[Install]" ]]; then
+            printf '%s\n\n' "${orphan_block}" >> "${tmp_svc}"
+        fi
+        printf '%s\n' "${line}" >> "${tmp_svc}"
+    done < "${SYSTEMD_SERVICE}"
+    cp "${tmp_svc}" "${SYSTEMD_SERVICE}"
+    rm -f "${tmp_svc}"
+
+    assert_file_contains "orphan injected" \
+        "# BEGIN backup_access orphan" "${SYSTEMD_SERVICE}"
+
+    out=$(run_sut_output admin-recreate-mounts \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}")
+    assert_contains "orphan: detected" "Orphaned service entry" "${out}"
+    assert_file_not_contains "orphan: removed from service" \
+        "# BEGIN backup_access orphan" "${SYSTEMD_SERVICE}"
+    # Non-orphan entries must survive
+    assert_file_contains "orphan: alpha still in service" \
+        "# BEGIN backup_access alpha" "${SYSTEMD_SERVICE}"
+    assert_file_contains "orphan: beta still in service" \
+        "# BEGIN backup_access beta" "${SYSTEMD_SERVICE}"
+
+    # --- Scenario 4: user in sshd_config but no service entry → should warn ---
+    # Manually add an SSH block for 'gamma' without a service entry
+    local gamma_ssh_block
+    gamma_ssh_block=$(printf '# BEGIN backup_access gamma\nMatch User gamma\n    ChrootDirectory %s/gamma\n    ForceCommand internal-sftp -R -d /backups\n# END backup_access gamma' \
+        "${REMOUNT_ROOT}")
+    printf '\n%s\n' "${gamma_ssh_block}" >> "${SSHD_CFG}"
+
+    out=$(run_sut_output admin-recreate-mounts \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}")
+    assert_contains "missing entry: warns about gamma" "No service entry" "${out}"
+    assert_contains "missing entry: suggests modify" "modify" "${out}"
+
+    # --- Scenario 5: dry-run → no changes ---
+    # Remove alpha's mount again to have a pending change
+    grep -vxF "${mp_alpha}" "${FAKE_MOUNTS}" > "${FAKE_MOUNTS}.tmp" || true
+    mv "${FAKE_MOUNTS}.tmp" "${FAKE_MOUNTS}"
+
+    local service_snap
+    service_snap=$(cat "${SYSTEMD_SERVICE}")
+
+    out=$(run_sut_output admin-recreate-mounts --dry-run \
+        -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}")
+    assert_contains "dry-run: says DRY-RUN" "DRY-RUN" "${out}"
+    assert_eq "dry-run: service unchanged" "${service_snap}" "$(cat "${SYSTEMD_SERVICE}")"
+    # Alpha should still be unmounted (dry-run didn't mount it)
+    assert_exits_fail "dry-run: alpha still unmounted" \
+        bash -c "grep -qxF '${mp_alpha}' '${FAKE_MOUNTS}'"
+
+    # Clean up
+    for u in alpha beta; do
+        run_sut delete -r "${REMOUNT_ROOT}" -s "${SSHD_CFG}" -a "${AUTHKEYS_DIR}" \
+            -u "${u}" >/dev/null 2>&1
+    done
+    # Remove the manually added gamma SSH block
+    reset_sshd_cfg
+    reset_service
 }
 
 test_help_flag() {
@@ -951,6 +1070,13 @@ test_help_flag() {
 
     out=$(bash "${SUT}" 2>&1 || true)
     assert_contains "no args shows help" "SYNOPSIS" "${out}"
+
+    out=$(bash "${SUT}" -i 2>&1 || true)
+    assert_contains "-i shows version" "1.2.0" "${out}"
+    assert_contains "-i shows script name" "backup_access" "${out}"
+
+    out=$(bash "${SUT}" --info 2>&1 || true)
+    assert_contains "--info shows version" "1.2.0" "${out}"
 }
 
 # ---------------------------------------------------------------------------
@@ -967,7 +1093,7 @@ main() {
     test_validation
     test_sshd_config_subsystem
     test_sshd_config_block
-    test_fstab_block
+    test_systemd_service_block
     test_add_idempotency
     test_modify
     test_delete
@@ -977,6 +1103,7 @@ main() {
     test_list_empty
     test_sshd_validation_failure
     test_conflicting_subsystem_preflight
+    test_admin_recreate_mounts
 
     printf '\n=== Results ===\n'
     printf 'PASS: %d\n' "${PASS}"
