@@ -178,11 +178,14 @@ test_help_and_version() {
     out=$(run_sut -h)
     assert_contains "-h also shows help" "Usage:" "${out}"
 
+    out=$(run_sut -?)
+    assert_contains "-? also shows help" "Usage:" "${out}"
+
     out=$(run_sut --version)
-    assert_eq "version: prints version" "1.2.0" "${out}"
+    assert_eq "version: prints version" "1.3.0" "${out}"
 
     out=$(run_sut -v)
-    assert_eq "-v also prints version" "1.2.0" "${out}"
+    assert_eq "-v also prints version" "1.3.0" "${out}"
 }
 
 test_unknown_option() {
@@ -1253,6 +1256,332 @@ JSON
 }
 
 # ---------------------------------------------------------------------------
+# -r / --run <name> tests
+# ---------------------------------------------------------------------------
+
+test_run_option() {
+    printf '\n=== -r / --run <name> tests ===\n'
+
+    local base_config
+    base_config="$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [
+    {"name": "alpha", "database": "alpha_db"},
+    {"name": "beta",  "database": "beta_db"},
+    {"name": "gamma", "database": "gamma_db"}
+  ]
+}
+JSON
+)"
+
+    # --- runs only the named task ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut -r alpha -c "${CONFIG}" >/dev/null
+    assert_eq "run -r: only one invocation" "1" "$(call_count)"
+    assert_contains "run -r: correct database" "--database-name alpha_db" "$(call_line 1)"
+
+    # --- long form --run ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut --run beta -c "${CONFIG}" >/dev/null
+    assert_eq "run --run: only one invocation" "1" "$(call_count)"
+    assert_contains "run --run: correct database" "--database-name beta_db" "$(call_line 1)"
+
+    # --- does NOT run other tasks ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut -r alpha -c "${CONFIG}" >/dev/null
+    local args; args=$(call_line 1)
+    assert_not_contains "run -r: beta not executed" "beta_db"  "${args}"
+    assert_not_contains "run -r: gamma not executed" "gamma_db" "${args}"
+
+    # --- start log shows single task name ---
+    write_config "${base_config}"
+    local out
+    out=$(run_sut -r alpha -c "${CONFIG}")
+    assert_contains "run -r: log shows task name" "1 zadanie: alpha" "${out}"
+
+    # --- combined with -d: adds --dry-run ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut -r beta -d -c "${CONFIG}" >/dev/null
+    assert_contains "run -r -d: dry-run added" "--dry-run" "$(call_line 1)"
+    assert_contains "run -r -d: correct database" "--database-name beta_db" "$(call_line 1)"
+
+    # --- nonexistent name: error + exit 1 ---
+    local err_out err_rc=0
+    write_config "${base_config}"
+    err_out=$(bash "${SUT}" -r nosuchdb -c "${CONFIG}" 2>&1) || err_rc=$?
+    assert_eq       "run -r: nonexistent exits 1"    "1"           "${err_rc}"
+    assert_contains "run -r: nonexistent error msg"  "nie istnieje" "${err_out}"
+    assert_contains "run -r: nonexistent names task" "nosuchdb"    "${err_out}"
+
+    # --- missing name argument (last arg): error + exit 64 ---
+    err_rc=0
+    err_out=$(bash "${SUT}" -r 2>&1) || err_rc=$?
+    assert_eq       "run -r: no name exits 64"       "64"                  "${err_rc}"
+    assert_contains "run -r: no name error msg"      "wymaga podania nazwy" "${err_out}"
+
+    # --- missing config file ---
+    err_rc=0
+    err_out=$(bash "${SUT}" -r alpha -c "/nonexistent/cfg_$$.json" 2>&1) || err_rc=$?
+    assert_eq       "run -r: missing config exits 1" "1"                        "${err_rc}"
+    assert_contains "run -r: missing config msg"     "Brak pliku konfiguracyjnego" "${err_out}"
+}
+
+# ---------------------------------------------------------------------------
+# -d / --dry-run CLI flag tests
+# ---------------------------------------------------------------------------
+
+test_cli_dry_run() {
+    printf '\n=== -d / --dry-run CLI flag tests ===\n'
+
+    local base_config
+    base_config="$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [
+    {"name": "db1", "database": "db1"},
+    {"name": "db2", "database": "db2"}
+  ]
+}
+JSON
+)"
+
+    # --- -d adds --dry-run to all invocations ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut -d -c "${CONFIG}" >/dev/null
+    assert_contains "cli dry-run -d: db1 gets --dry-run" "--dry-run" "$(call_line 1)"
+    assert_contains "cli dry-run -d: db2 gets --dry-run" "--dry-run" "$(call_line 2)"
+
+    # --- --dry-run long form ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut --dry-run -c "${CONFIG}" >/dev/null
+    assert_contains "cli dry-run --dry-run: db1 gets --dry-run" "--dry-run" "$(call_line 1)"
+    assert_contains "cli dry-run --dry-run: db2 gets --dry-run" "--dry-run" "$(call_line 2)"
+
+    # --- -d reflected in start log ---
+    write_config "${base_config}"
+    local out
+    out=$(run_sut -d -c "${CONFIG}")
+    assert_contains "cli dry-run: log shows global_dry_run=true" "global_dry_run=true" "${out}"
+
+    # --- no duplication when backup already has --dry-run in options ---
+    reset_call_log
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [
+    {"name": "db1", "database": "db1", "options": ["--dry-run"]}
+  ]
+}
+JSON
+)"
+    run_sut -d -c "${CONFIG}" >/dev/null
+    local args
+    args=$(call_line 1)
+    # count occurrences — should be exactly one --dry-run
+    local count
+    count=$(grep -o -- '--dry-run' <<< "${args}" | wc -l)
+    assert_eq "cli dry-run: no duplicate --dry-run" "1" "${count}"
+
+    # --- -d overrides global_dry_run=false in JSON ---
+    reset_call_log
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "global_dry_run": false,
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1"}]
+}
+JSON
+)"
+    run_sut -d -c "${CONFIG}" >/dev/null
+    assert_contains "cli dry-run: overrides json global_dry_run=false" "--dry-run" "$(call_line 1)"
+
+    # --- without -d and global_dry_run=false: no --dry-run ---
+    reset_call_log
+    write_config "${base_config}"
+    run_sut -c "${CONFIG}" >/dev/null
+    assert_not_contains "no -d: no --dry-run added" "--dry-run" "$(call_line 1)"
+}
+
+# ---------------------------------------------------------------------------
+# -l / --list tests
+# ---------------------------------------------------------------------------
+
+test_list_option() {
+    printf '\n=== -l / --list tests ===\n'
+
+    # --- basic output: header and task count ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "backup_root": "/mnt/backups",
+  "default_retention": "14d",
+  "default_host": "db.example.com",
+  "default_port": 5432,
+  "default_user": "backupuser",
+  "default_password": "S3cret!",
+  "backups": [
+    {"name": "mydb", "database": "mydb"},
+    {"name": "otherdb", "database": "otherdb"}
+  ]
+}
+JSON
+)"
+
+    local out rc=0
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1) || rc=$?
+    assert_eq   "list: exits 0"              "0"          "${rc}"
+    assert_contains "list: shows config path"  "${CONFIG}"  "${out}"
+    assert_contains "list: shows task count 2" "Liczba zadań: 2" "${out}"
+    assert_contains "list: shows name mydb"    "mydb"       "${out}"
+    assert_contains "list: shows name otherdb" "otherdb"    "${out}"
+
+    # --- does NOT invoke backup script ---
+    reset_call_log
+    bash "${SUT}" -l -c "${CONFIG}" >/dev/null 2>&1 || true
+    assert_eq "list: does not run backup script" "0" "$(call_count)"
+
+    # --- shows effective field values (defaults applied) ---
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list: shows host"       "db.example.com:5432" "${out}"
+    assert_contains "list: shows user"       "backupuser"          "${out}"
+    assert_contains "list: shows database"   "database:   mydb"    "${out}"
+    assert_contains "list: shows backup_dir" "/mnt/backups"        "${out}"
+    assert_contains "list: shows retention"  "14d"                 "${out}"
+
+    # --- long form --list ---
+    out=$(bash "${SUT}" --list -c "${CONFIG}" 2>&1) || true
+    assert_contains "list: --list long form" "Liczba zadań: 2" "${out}"
+
+    # --- per-backup overrides shown correctly ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "default-host",
+  "default_port": 5432,
+  "default_user": "default-user",
+  "default_password": "pass",
+  "backups": [
+    {
+      "name": "custom",
+      "host": "custom-host",
+      "port": 5433,
+      "user": "custom-user",
+      "database": "customdb",
+      "backup_dir": "/srv/custom",
+      "retention_time": "30d"
+    }
+  ]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list override: host"       "custom-host:5433"  "${out}"
+    assert_contains "list override: user"       "custom-user"       "${out}"
+    assert_contains "list override: database"   "customdb"          "${out}"
+    assert_contains "list override: backup_dir" "/srv/custom"       "${out}"
+    assert_contains "list override: retention"  "30d"               "${out}"
+
+    # --- pg_dump version shown when set ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "default_pg_dump_version": "14.11",
+  "backups": [
+    {"name": "db1", "database": "db1"},
+    {"name": "db2", "database": "db2", "pg_dump_version": "15.6"}
+  ]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list pg_dump: default version shown" "14.11" "${out}"
+    assert_contains "list pg_dump: per-backup override shown" "15.6" "${out}"
+
+    # --- pg_dump line absent when not configured ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1"}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_not_contains "list pg_dump: absent when not set" "pg_dump:" "${out}"
+
+    # --- SSH details shown ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [
+    {
+      "name": "tunneled",
+      "database": "db1",
+      "ssh_host": "jump.example.com",
+      "ssh_port": 2222,
+      "ssh_user": "tunnel",
+      "ssh_key": "/root/.ssh/id_rsa",
+      "ssh_local_port": 15432
+    }
+  ]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list ssh: host shown"       "jump.example.com"  "${out}"
+    assert_contains "list ssh: user shown"       "tunnel@"           "${out}"
+    assert_contains "list ssh: key shown"        "key=/root/.ssh/id_rsa" "${out}"
+    assert_contains "list ssh: local_port shown" "local_port=15432"  "${out}"
+
+    # --- options shown ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [
+    {"name": "db1", "database": "db1", "options": ["--dry-run", "--verbose"]}
+  ]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list options: shown" "--dry-run" "${out}"
+    assert_contains "list options: all shown" "--verbose" "${out}"
+
+    # --- empty backups array ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "backups": []
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_eq   "list empty: exits 0"       "0" "$(bash "${SUT}" -l -c "${CONFIG}" >/dev/null 2>&1; echo $?)"
+    assert_contains "list empty: count 0"   "Liczba zadań: 0" "${out}"
+    assert_contains "list empty: info text" "Brak zdefiniowanych" "${out}"
+
+    # --- missing config fails ---
+    local err_out err_rc=0
+    err_out=$(bash "${SUT}" -l -c "/nonexistent/cfg_$$.json" 2>&1) || err_rc=$?
+    assert_eq       "list missing config: non-zero exit"  "1"                     "${err_rc}"
+    assert_contains "list missing config: error message"  "Brak pliku konfiguracyjnego" "${err_out}"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -1272,6 +1601,15 @@ main() {
     # Config flags
     test_config_flag_long
     test_config_flag_short
+
+    # Run single task by name
+    test_run_option
+
+    # Dry-run CLI flag
+    test_cli_dry_run
+
+    # List option
+    test_list_option
 
     # Empty / missing backups
     test_empty_backups_array

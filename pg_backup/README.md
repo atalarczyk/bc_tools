@@ -149,9 +149,10 @@ A lock file (`<backup-dir>/<database-name>/.pg_backup.lock`) prevents parallel r
 ### Purpose
 - Read a JSON config file.
 - Apply global defaults (host/port/user/password/retention/backup dir/pg_dump version/SSH settings).
-- Execute `pg_backup.sh` per entry in `backups[]`.
+- Execute `pg_backup.sh` per entry in `backups[]`, or only for a single named entry (`-r`).
 - Allow per-job overrides for all parameters.
-- Support global dry-run mode (`global_dry_run`).
+- Support global dry-run mode via config (`global_dry_run`) or CLI flag (`-d`).
+- List all configured backup tasks with their effective parameters (`-l`).
 
 ### Usage
 ```bash
@@ -160,8 +161,11 @@ A lock file (`<backup-dir>/<database-name>/.pg_backup.lock`) prevents parallel r
 
 Options:
 - `-c`, `--config <path>` — path to JSON config (default: `/usr/local/etc/pg_backup.json`)
+- `-d`, `--dry-run` — force dry-run mode: appends `--dry-run` to every `pg_backup.sh` call (overrides `global_dry_run: false` in config)
+- `-r`, `--run <name>` — run only the backup entry with the given `name` (requires `-c`); exits with error if `<name>` is not found
+- `-l`, `--list` — print all configured backup tasks with their effective parameters and exit (requires a readable config)
 - `-v`, `--version` — print script version and exit
-- `-h`, `--help` — show help
+- `-h`, `--help`, `-?` — show help
 
 ### Validation
 
@@ -169,8 +173,27 @@ The runner skips entries missing required fields (`host`, `user`, `password`, `d
 
 ### Exit codes
 - `0` — all backups completed (individual failures are logged but don't stop the batch)
-- `1` — configuration error (missing `jq`, unreadable config file, non-executable backup script)
-- `64` — usage error (unknown option)
+- `1` — configuration error (missing `jq`, unreadable config file, non-executable backup script, task name not found with `-r`)
+- `64` — usage error (unknown option, missing argument for `-r`)
+
+### Examples
+
+```bash
+# Run all backups from a config file
+./run_pg_backups.sh -c /usr/local/etc/pg_backup.json
+
+# List all configured tasks with their effective parameters
+./run_pg_backups.sh -c /usr/local/etc/pg_backup.json --list
+
+# Run only the task named "erpdb"
+./run_pg_backups.sh -c /usr/local/etc/pg_backup.json -r erpdb
+
+# Run only "erpdb" in dry-run mode (no actual backup)
+./run_pg_backups.sh -c /usr/local/etc/pg_backup.json -r erpdb -d
+
+# Force dry-run for all tasks (useful for testing config)
+./run_pg_backups.sh -c /usr/local/etc/pg_backup.json -d
+```
 
 ### Dependencies
 - `bash`, `jq`
@@ -280,4 +303,5 @@ chmod +x pg_backup.sh run_pg_backups.sh
 - Log messages in `run_pg_backups.sh` are in Polish.
 - `pg_backup.sh` writes checksum files next to dump files in the database backup directory.
 - Backup files are created with restrictive permissions (owner-only read/write).
-- The `global_dry_run` flag in config does not override per-job `--dry-run` if already present in `options`.
+- Dry-run can be activated in three ways: `global_dry_run: true` in JSON, the `-d`/`--dry-run` CLI flag, or `--dry-run` in a per-job `options` array. All three paths deduplicate: `--dry-run` is passed to `pg_backup.sh` at most once per job.
+- The `-d` CLI flag takes precedence over `global_dry_run: false` in config.
