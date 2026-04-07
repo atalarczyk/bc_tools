@@ -182,10 +182,10 @@ test_help_and_version() {
     assert_contains "-? also shows help" "Usage:" "${out}"
 
     out=$(run_sut --version)
-    assert_eq "version: prints version" "1.3.0" "${out}"
+    assert_eq "version: prints version" "1.3.1" "${out}"
 
     out=$(run_sut -v)
-    assert_eq "-v also prints version" "1.3.0" "${out}"
+    assert_eq "-v also prints version" "1.3.1" "${out}"
 }
 
 test_unknown_option() {
@@ -1455,9 +1455,40 @@ JSON
     out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
     assert_contains "list: shows host"       "db.example.com:5432" "${out}"
     assert_contains "list: shows user"       "backupuser"          "${out}"
+    assert_contains "list: shows password"   "password:   ***"     "${out}"
     assert_contains "list: shows database"   "database:   mydb"    "${out}"
     assert_contains "list: shows backup_dir" "/mnt/backups"        "${out}"
     assert_contains "list: shows retention"  "14d"                 "${out}"
+
+    # --- password shown as <brak> when not configured ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u",
+  "backups": [{"name": "nopw", "database": "nopw_db"}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list: no password shows brak" "password:   <brak>" "${out}"
+
+    # restore original config for subsequent tests
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "backup_root": "/mnt/backups",
+  "default_retention": "14d",
+  "default_host": "db.example.com",
+  "default_port": 5432,
+  "default_user": "backupuser",
+  "default_password": "S3cret!",
+  "backups": [
+    {"name": "mydb", "database": "mydb"},
+    {"name": "otherdb", "database": "otherdb"}
+  ]
+}
+JSON
+)"
 
     # --- long form --list ---
     out=$(bash "${SUT}" --list -c "${CONFIG}" 2>&1) || true
@@ -1560,6 +1591,58 @@ JSON
     out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
     assert_contains "list options: shown" "--dry-run" "${out}"
     assert_contains "list options: all shown" "--verbose" "${out}"
+
+    # --- global_dry_run=true in JSON adds --dry-run to effective options ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "global_dry_run": true,
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1"}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_contains "list global_dry_run: --dry-run in options" "options:    --dry-run" "${out}"
+
+    # --- global_dry_run=true does not duplicate per-job --dry-run ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "global_dry_run": true,
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1", "options": ["--dry-run"]}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    local dr_count
+    dr_count=$(grep -o -- '--dry-run' <<< "${out}" | wc -l)
+    assert_eq "list global_dry_run: no duplicate --dry-run" "1" "${dr_count}"
+
+    # --- -d CLI flag adds --dry-run to effective options ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1"}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -d -c "${CONFIG}" 2>&1)
+    assert_contains "list -d flag: --dry-run in options" "options:    --dry-run" "${out}"
+
+    # --- without global_dry_run and without -d: no options line ---
+    write_config "$(cat <<JSON
+{
+  "backup_script": "${FAKE_BACKUP_SH}",
+  "default_host": "h", "default_user": "u", "default_password": "p",
+  "backups": [{"name": "db1", "database": "db1"}]
+}
+JSON
+)"
+    out=$(bash "${SUT}" -l -c "${CONFIG}" 2>&1)
+    assert_not_contains "list no dry-run: no options line" "options:" "${out}"
 
     # --- empty backups array ---
     write_config "$(cat <<JSON

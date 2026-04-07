@@ -163,7 +163,7 @@ Options:
 - `-c`, `--config <path>` — path to JSON config (default: `/usr/local/etc/pg_backup.json`)
 - `-d`, `--dry-run` — force dry-run mode: appends `--dry-run` to every `pg_backup.sh` call (overrides `global_dry_run: false` in config)
 - `-r`, `--run <name>` — run only the backup entry with the given `name` (requires `-c`); exits with error if `<name>` is not found
-- `-l`, `--list` — print all configured backup tasks with their effective parameters and exit (requires a readable config)
+- `-l`, `--list` — print all configured backup tasks with their effective parameters and exit (requires a readable config); reflects `global_dry_run` and `-d` in the displayed options
 - `-v`, `--version` — print script version and exit
 - `-h`, `--help`, `-?` — show help
 

@@ -7,7 +7,7 @@
 #------------------------------------------------------------------------------
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 
 DEFAULT_CONFIG="/usr/local/etc/pg_backup.json"
 CONFIG_FILE="$DEFAULT_CONFIG"
@@ -66,6 +66,15 @@ DEFAULT_SSH_USER=$(jq -r '.default_ssh_user // null' "$CONFIG_FILE")
 DEFAULT_SSH_KEY=$(jq -r '.default_ssh_key // null' "$CONFIG_FILE")
 DEFAULT_SSH_PASS=$(jq -r '.default_ssh_password // null' "$CONFIG_FILE")
 
+# helper: sprawdź czy tablica opcji zawiera daną flagę
+has_flag() {
+  local flag="$1"; shift
+  for opt in "$@"; do
+    [[ "$opt" == "$flag" ]] && return 0
+  done
+  return 1
+}
+
 # --- list backups (-l) ---
 list_backups() {
   local count
@@ -77,12 +86,13 @@ list_backups() {
     return
   fi
   for i in $(seq 0 $((count - 1))); do
-    local name host port user dbname backup_dir retention pg_dump_ver
+    local name host port user pass dbname backup_dir retention pg_dump_ver
     local ssh_host ssh_port ssh_user ssh_key ssh_pass ssh_local_port
     name=$(jq -r ".backups[$i].name" "$CONFIG_FILE")
     host=$(jq -r ".backups[$i].host // \"$DEFAULT_HOST\"" "$CONFIG_FILE")
     port=$(jq -r ".backups[$i].port // $DEFAULT_PORT" "$CONFIG_FILE")
     user=$(jq -r ".backups[$i].user // \"$DEFAULT_USER\"" "$CONFIG_FILE")
+    pass=$(jq -r ".backups[$i].password // \"$DEFAULT_PASS\"" "$CONFIG_FILE")
     dbname=$(jq -r ".backups[$i].database" "$CONFIG_FILE")
     backup_dir=$(jq -r ".backups[$i].backup_dir // \"$BACKUP_ROOT\"" "$CONFIG_FILE")
     retention=$(jq -r ".backups[$i].retention_time // \"$RETENTION_DEFAULT\"" "$CONFIG_FILE")
@@ -97,6 +107,11 @@ list_backups() {
     printf '\n[%d] %s\n' "$((i+1))" "$name"
     printf '    host:       %s:%s\n' "${host:-<brak>}" "$port"
     printf '    user:       %s\n' "${user:-<brak>}"
+    if [[ -n "$pass" && "$pass" != "null" ]]; then
+      printf '    password:   ***\n'
+    else
+      printf '    password:   <brak>\n'
+    fi
     printf '    database:   %s\n' "${dbname:-<brak>}"
     printf '    backup_dir: %s\n' "$backup_dir"
     printf '    retention:  %s\n' "$retention"
@@ -112,6 +127,9 @@ list_backups() {
     fi
     local -a options=()
     readarray -t options < <(jq -r ".backups[$i].options[]?" "$CONFIG_FILE")
+    if [[ "$GLOBAL_DRY_RUN" == "true" ]] && ! has_flag "--dry-run" "${options[@]}"; then
+      options+=("--dry-run")
+    fi
     if [[ ${#options[@]} -gt 0 ]]; then
       printf '    options:    %s\n' "${options[*]}"
     fi
@@ -145,15 +163,6 @@ else
   log "▶️  Start ($BACKUP_COUNT zadań) | config=$CONFIG_FILE | global_dry_run=$GLOBAL_DRY_RUN"
 fi
 log "   Domyślne: host=${DEFAULT_HOST:-<brak>}, port=${DEFAULT_PORT}, user=${DEFAULT_USER:-<brak>}, retention=$RETENTION_DEFAULT, pg_dump=${PG_DUMP_VERSION_DEFAULT:-<domyślny z PATH>}"
-
-# helper: sprawdź czy tablica opcji zawiera daną flagę
-has_flag() {
-  local flag="$1"; shift
-  for opt in "$@"; do
-    [[ "$opt" == "$flag" ]] && return 0
-  done
-  return 1
-}
 
 # --- iteracja po backupach ---
 for i in "${LOOP_INDICES[@]}"; do
