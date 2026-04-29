@@ -1,0 +1,46 @@
+{
+  "backup_script": "/usr/local/bin/file_backup.sh",
+  "backup_root": "/var/local/backup/files",
+  "default_retention": "30d",
+  "default_full_backup_frequency": "7d",
+  "default_incremental_backup_frequency": "12h",
+
+  "default_host": "files.example.com",
+  "default_ssh_port": 22,
+  "default_ssh_user": "backup",
+  "default_ssh_key": "/root/.ssh/id_backup",
+  "default_ssh_password": null,
+  "default_remote_rsync_path": "/usr/bin/rsync",
+
+  "global_dry_run": false,
+
+  "backups": [
+    {
+      "name": "documents",
+      "source_dir": "/srv/data/documents"
+    },
+    {
+      "name": "photos",
+      "source_dir": "/srv/data/photos",
+      "retention_time": "45d",
+      "full_backup_frequency": "14d",
+      "incremental_backup_frequency": "24h"
+    },
+    {
+      "name": "erp-export",
+      "host": "erp-storage.internal",
+      "source_dir": "/var/lib/exports",
+      "backup_dir": "/srv/backups/files",
+      "ssh_user": "syncuser",
+      "ssh_key": "/root/.ssh/id_erp_backup",
+      "remote_rsync_path": "/usr/local/bin/rsync",
+      "options": ["--exclude", "*.tmp", "--exclude", "cache/"]
+    },
+    {
+      "name": "daily-report-drop",
+      "source_dir": "/srv/reports",
+      "ssh_password": "SshPass!",
+      "options": ["--dry-run"]
+    }
+  ]
+}
